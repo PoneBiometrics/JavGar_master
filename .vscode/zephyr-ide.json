@@ -1,3 +1,15 @@
 {
-  "projects": {}
+  "projects": {
+    "blinky": {
+      "rel_path": "blinky",
+      "name": "blinky",
+      "buildConfigs": {},
+      "confFiles": {
+        "config": [],
+        "extraConfig": [],
+        "overlay": [],
+        "extraOverlay": []
+      }
+    }
+  }
 }
