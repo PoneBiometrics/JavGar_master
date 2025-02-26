@@ -16,7 +16,7 @@ static volatile size_t rx_pos = 0;
 struct participant_data {
     uint32_t receiver_index;
     uint8_t secret_share[32];
-    uint8_t public_key[33];
+    uint8_t public_key[64];
     uint8_t group_public_key[33];
     uint32_t key_index;
     uint32_t max_participants;
@@ -38,10 +38,6 @@ void uart_cb(const struct device *dev, void *user_data)
                 struct participant_data received_data;
                 memcpy(&received_data, rx_buf, sizeof(received_data));
 
-                // Introduce a delay before printing
-                printk("Data received. Waiting 10 seconds before printing...\n");
-                k_sleep(K_SECONDS(10));  // Wait for 5 seconds
-
                 // Print the received data
                 printk("\n=== Received Data ===\n");
                 printk("Receiver Index: %d\n", received_data.receiver_index);
@@ -56,7 +52,7 @@ void uart_cb(const struct device *dev, void *user_data)
                 printk("\n");
 
                 printk("Public Key: ");
-                for (int i = 0; i < 33; i++) {
+                for (int i = 0; i < 64; i++) {
                     printk("%02x", received_data.public_key[i]);
                 }
                 printk("\n");

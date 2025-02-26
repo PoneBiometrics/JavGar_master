@@ -242,7 +242,7 @@ int main(void) {
         typedef struct {
             uint32_t receiver_index;
             uint8_t secret_share[32];
-            uint8_t public_key[33];
+            uint8_t public_key[64];
             uint8_t group_public_key[33];
             uint32_t key_index;
             uint32_t max_participants;
@@ -252,7 +252,7 @@ int main(void) {
         ParticipantData data;
         data.receiver_index = shares_by_participant[i].receiver_index;
         memcpy(data.secret_share, shares_by_participant[i].value, 32);
-        memcpy(data.public_key, keypairs[i].public_keys.public_key, 33);
+        memcpy(data.public_key, keypairs[i].public_keys.public_key, 64);
         memcpy(data.group_public_key, keypairs[i].public_keys.group_public_key, 33);
         data.key_index = keypairs[i].public_keys.index;
         data.max_participants = keypairs[i].public_keys.max_participants;
