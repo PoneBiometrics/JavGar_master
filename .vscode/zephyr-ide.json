@@ -1,9 +1,30 @@
 {
   "projects": {
-    "blinky": {
-      "rel_path": "blinky",
-      "name": "blinky",
-      "buildConfigs": {},
+    "receive_usb": {
+      "rel_path": "receive_usb",
+      "name": "receive_usb",
+      "buildConfigs": {
+        "build\\nucleo_l476rg": {
+          "board": "nucleo_l476rg",
+          "relBoardSubDir": "st\\nucleo_l476rg",
+          "name": "build\\nucleo_l476rg",
+          "westBuildArgs": "",
+          "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
+          "confFiles": {
+            "config": [],
+            "extraConfig": [],
+            "overlay": [],
+            "extraOverlay": []
+          },
+          "runnerConfigs": {
+            "stm32cubeprogrammer": {
+              "runner": "stm32cubeprogrammer",
+              "name": "stm32cubeprogrammer",
+              "args": ""
+            }
+          }
+        }
+      },
       "confFiles": {
         "config": [],
         "extraConfig": [],

@@ -15,6 +15,8 @@ USING THE LIBRARY https://github.com/bancaditalia/secp256k1-frost BUILDING IT AS
 
 //#include "secp256k1-frost/examples/examples_util.h"
 
+#include <windows.h>
+
 #define N 3 // Number of participants
 #define T 2 // Threshold of needed participants
 
@@ -34,6 +36,7 @@ void print_secret_share(const secp256k1_frost_keygen_secret_share *share) {
 
 int main(void) {
     printf("=== Starting FROST Presigning proccess ===\n");
+    printf("\n");
 
     unsigned char msg[12] = "Hello World!";
     unsigned char msg_hash[32];
@@ -167,13 +170,13 @@ int main(void) {
         T
     );
     if (return_val != 1) {
-        printf("Key generation failed! Error code: %d\n", return_val);
         return 1;
     }
     printf("Key generation succeeded.\n");
 
     // Print shares and public keys for all participants
     printf("\n=== Participants ===\n");
+    printf("\n");
     for (int i = 0; i < N; i++) {
         printf("Participant %d:\n", i + 1);
 
@@ -181,17 +184,102 @@ int main(void) {
         print_secret_share(&shares_by_participant[i]);
 
         // Print public key
+        print_hex("  Group Public Key", keypairs[i].public_keys.group_public_key, 33);
         print_hex("  Public Key", keypairs[i].public_keys.public_key, sizeof(keypairs[i].public_keys.public_key));
 
         // Print public key metadata (if available)
         printf("  Public Key Index: %u\n", keypairs[i].public_keys.index);
         printf("  Max Participants: %u\n", keypairs[i].public_keys.max_participants);
-        printf("\n");
     }
 
-    printf("\n=== Program Completed Successfully ===\n");
-    return 0;
+    printf("\n=== Generation Completed Successfully ===\n");
+    printf("\n");
 
 /* KEY DISTRIBUTION */
+    printf("\n=== Starting Key Distribution ===\n");
+    printf("\n");
 
+    for (int i = 0; i < N; i++) {
+        printf("Sending data to participant %d's device...\n", i + 1);
+        printf("Connect the device and press Enter...");
+        getchar(); // Wait for user to connect each device sequentially
+    
+        HANDLE hSerial = CreateFile("COM3",
+            GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+    
+        if (hSerial == INVALID_HANDLE_VALUE) {
+            printf("Failed to open COM port. Error: %lu\n", GetLastError());
+            return 1;
+        }
+    
+        // Configure serial port settings
+        DCB dcbSerialParams = {0};
+        dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+        if (!GetCommState(hSerial, &dcbSerialParams)) {
+            printf("Error getting port state\n");
+            CloseHandle(hSerial);
+            return 1;
+        }
+    
+        dcbSerialParams.BaudRate = CBR_115200;
+        dcbSerialParams.ByteSize = 8;
+        dcbSerialParams.StopBits = ONESTOPBIT;
+        dcbSerialParams.Parity = NOPARITY;
+    
+        if (!SetCommState(hSerial, &dcbSerialParams)) {
+            printf("Error setting port state\n");
+            CloseHandle(hSerial);
+            return 1;
+        }
+    
+        // Prepare data structure (packed for binary transmission)
+        #pragma pack(push, 1)
+        typedef struct {
+            uint32_t receiver_index;
+            uint8_t secret_share[32];
+            uint8_t public_key[33];
+            uint8_t group_public_key[33];
+            uint32_t key_index;
+            uint32_t max_participants;
+        } ParticipantData;
+        #pragma pack(pop)
+    
+        ParticipantData data;
+        data.receiver_index = shares_by_participant[i].receiver_index;
+        memcpy(data.secret_share, shares_by_participant[i].value, 32);
+        memcpy(data.public_key, keypairs[i].public_keys.public_key, 33);
+        memcpy(data.group_public_key, keypairs[i].public_keys.group_public_key, 33);
+        data.key_index = keypairs[i].public_keys.index;
+        data.max_participants = keypairs[i].public_keys.max_participants;
+    
+        // Send data
+        DWORD bytesWritten;
+        if (!WriteFile(hSerial, &data, sizeof(data), &bytesWritten, NULL)) {
+            printf("Write failed. Error: %lu\n", GetLastError());
+            CloseHandle(hSerial);
+            return 1;
+        }
+    
+        if (bytesWritten != sizeof(data)) {
+            printf("Partial write: %lu/%zu bytes\n", bytesWritten, sizeof(data));
+            CloseHandle(hSerial);
+            return 1;
+        }
+    
+        printf("Successfully sent data to participant %d\n", i + 1);
+        CloseHandle(hSerial);
+    }
+    
+    printf("\n=== Key Distribution Completed ===\n");
+     
+    // Cleanup
+    secp256k1_context_destroy(sign_verify_ctx);
+    secp256k1_frost_vss_commitments_destroy(dealer_commitments);
+    
+    return 0;
 }

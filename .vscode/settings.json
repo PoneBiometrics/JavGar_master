@@ -7,6 +7,11 @@
         "secp256k1.h": "c",
         "examples_util.h": "c",
         "secp256k1_frost.h": "c",
-        "string.h": "c"
+        "string.h": "c",
+        "flash_map.h": "c",
+        "compare": "c",
+        "expected": "c",
+        "xlocale": "c",
+        "*.s": "c"
     }
 }
