@@ -204,7 +204,7 @@ int main(void) {
         printf("Connect the device and press Enter...");
         getchar(); // Wait for user to connect each device sequentially
     
-        HANDLE hSerial = CreateFile("COM3",
+        HANDLE hSerial = CreateFile("COM6",
             GENERIC_WRITE,
             0,
             NULL,
