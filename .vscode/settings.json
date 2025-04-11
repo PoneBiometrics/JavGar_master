@@ -12,6 +12,7 @@
         "compare": "c",
         "expected": "c",
         "xlocale": "c",
-        "*.s": "c"
+        "*.s": "c",
+        "log.h": "c"
     }
 }

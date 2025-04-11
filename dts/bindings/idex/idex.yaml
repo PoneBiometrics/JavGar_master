@@ -1,0 +1,16 @@
+description: IDEX Fingerprint sensor
+
+compatible: "idex"
+
+include: [spi-device.yaml]
+
+properties:
+    idex-stby-gpios:
+      type: phandle-array
+      required: true
+      description: STANDBY pin.
+
+    idex-rdy-gpios:
+      type: phandle-array
+      required: true
+      description: READY pin.

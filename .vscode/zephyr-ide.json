@@ -4,6 +4,102 @@
       "rel_path": "receive_usb",
       "name": "receive_usb",
       "buildConfigs": {
+        "build\\offpad": {
+          "board": "offpad",
+          "relBoardSubDir": "st\\offpad",
+          "name": "build\\offpad",
+          "westBuildArgs": "",
+          "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
+          "confFiles": {
+            "config": [],
+            "extraConfig": [],
+            "overlay": [],
+            "extraOverlay": []
+          },
+          "runnerConfigs": {
+            "stm32cubeprogrammer": {
+              "runner": "stm32cubeprogrammer",
+              "name": "stm32cubeprogrammer",
+              "args": ""
+            }
+          }
+        }
+      },
+      "confFiles": {
+        "config": [],
+        "extraConfig": [],
+        "overlay": [],
+        "extraOverlay": []
+      }
+    },
+    "receive_bluetooth": {
+      "rel_path": "receive_bluetooth",
+      "name": "receive_bluetooth",
+      "buildConfigs": {
+        "build\\offpad": {
+          "board": "offpad",
+          "relBoardSubDir": "st\\offpad",
+          "name": "build\\offpad",
+          "westBuildArgs": "",
+          "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
+          "confFiles": {
+            "config": [],
+            "extraConfig": [],
+            "overlay": [],
+            "extraOverlay": []
+          },
+          "runnerConfigs": {
+            "stm32cubeprogrammer": {
+              "runner": "stm32cubeprogrammer",
+              "name": "stm32cubeprogrammer",
+              "args": ""
+            }
+          }
+        }
+      },
+      "confFiles": {
+        "config": [],
+        "extraConfig": [],
+        "overlay": [],
+        "extraOverlay": []
+      }
+    },
+    "hello_world": {
+      "rel_path": "hello_world",
+      "name": "hello_world",
+      "buildConfigs": {
+        "build\\nucleo_f207zg": {
+          "board": "nucleo_f207zg",
+          "relBoardSubDir": "st\\nucleo_f207zg",
+          "name": "build\\nucleo_f207zg",
+          "westBuildArgs": "",
+          "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
+          "confFiles": {
+            "config": [],
+            "extraConfig": [],
+            "overlay": [],
+            "extraOverlay": []
+          },
+          "runnerConfigs": {
+            "stm32cubeprogrammer": {
+              "runner": "stm32cubeprogrammer",
+              "name": "stm32cubeprogrammer",
+              "args": ""
+            }
+          }
+        }
+      },
+      "confFiles": {
+        "config": [],
+        "extraConfig": [],
+        "overlay": [],
+        "extraOverlay": []
+      }
+    },
+    "signing": {
+      "rel_path": "signing",
+      "name": "signing",
+      "buildConfigs": {
         "build\\nucleo_l476rg": {
           "board": "nucleo_l476rg",
           "relBoardSubDir": "st\\nucleo_l476rg",

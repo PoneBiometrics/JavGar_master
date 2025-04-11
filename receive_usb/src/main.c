@@ -7,7 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#define UART_NODE DT_NODELABEL(usart1)
+#define UART_NODE DT_NODELABEL(lpuart1) // usart1 if using COM6 when attaching a new USB in the pins or usart2 if using COM3 (in this case not possible to debug at the same time)
 #define RX_BUF_SIZE 2048
 
 LOG_MODULE_REGISTER(uart_receiver, LOG_LEVEL_INF);

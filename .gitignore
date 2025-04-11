@@ -1,5 +1,8 @@
 .venv/
 external
+/recive_bluetooth
+/offpad
+/hello_world
 **/build*/
 .vscode/compile_commands.json
 zephyr-sdk-0.17.0/

@@ -10,3 +10,7 @@ manifest:
       clone-depth: 1
       import:
         path-prefix: external
+    - name: secp256k1-frost
+      path: external/modules/crypto/secp256k1-frost
+      url: https://github.com/bancaditalia/secp256k1-frost
+      revision: frost
