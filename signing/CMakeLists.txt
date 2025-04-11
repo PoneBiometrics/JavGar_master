@@ -2,19 +2,18 @@ cmake_minimum_required(VERSION 3.20)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(signing)
 
-# Include secp256k1 source files directly
 file(GLOB_RECURSE SECP256K1_SOURCES
   modules/secp256k1/src/*.c
   # modules/secp256k1/src/modules/frost/*.c
 )
 
-# Add secp256k1 sources to your app
+# Sources
 target_sources(app PRIVATE
   src/main.c
   ${SECP256K1_SOURCES}
 )
 
-# Include secp256k1 headers
+# Headers
 zephyr_include_directories(
   modules/secp256k1/include
   modules/secp256k1/src/*.h
