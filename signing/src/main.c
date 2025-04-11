@@ -12,7 +12,6 @@ LOG_MODULE_REGISTER(uart_receiver, LOG_LEVEL_INF);
 
 int main(void) {
 
-    k_msleep(500);  // Allow hardware to stabilize
     LOG_INF("System initialized");
 
     unsigned char msg[12] = "Hello World!";
