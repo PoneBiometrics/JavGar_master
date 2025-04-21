@@ -30,8 +30,11 @@
 #include <sys/random.h>
 #elif defined(__OpenBSD__)
 #include <unistd.h>
-// #else
-// #error "Couldn't identify the OS"
+#elif defined(__ZEPHYR__)
+#include <zephyr/device.h>
+#include <zephyr/drivers/entropy.h>
+#else
+#error "Couldn't identify the OS"
 #endif
 
 #include <stddef.h>
@@ -65,14 +68,12 @@ static int fill_random(unsigned char* data, size_t size) {
     } else {
         return 0;
     }
-#else
-    /* Use Zephyr's cryptographically secure random number generation API */
-    int res = sys_csrand_get(data, size);
-    if (res == 0) {
-        return 1;
-    } else {
+#elif defined(__ZEPHYR__)
+    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_entropy));
+    if (!device_is_ready(dev)) {
         return 0;
     }
+    return entropy_get_entropy(dev, data, size) == 0 ? 1 : 0;
 #endif
     return 0;
 }

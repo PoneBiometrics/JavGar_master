@@ -27,3 +27,4 @@ zephyr_compile_definitions(
 )
 
 target_compile_options(app PRIVATE -Wno-unused-function)
+add_definitions(-D__ZEPHYR__)

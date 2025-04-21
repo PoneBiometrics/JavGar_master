@@ -1,18 +1,32 @@
-#include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h> 
+#include <stdio.h>
+#include <assert.h>
+#include <string.h>
+#include <stdint.h>
 #include <zephyr/logging/log.h>
 
 #include <secp256k1.h>
 #include <secp256k1_frost.h>
 
-#define N 3 
-#define T 2
+#include "examples_util.h"
+
+#define EXAMPLE_MAX_PARTICIPANTS 3
+#define EXAMPLE_MIN_PARTICIPANTS 2
 
 LOG_MODULE_REGISTER(uart_receiver, LOG_LEVEL_INF);
 
+static void log_hex(const char *label, const uint8_t *data, size_t len) {
+    char hexstr[2 * len + 1];
+
+    for (size_t i = 0; i < len; i++) {
+        snprintf(&hexstr[i * 2], 3, "%02x", data[i]);
+    }
+
+    LOG_INF("%s: 0x%s", label, hexstr);
+}
+
 int main(void) {
 
-    LOG_INF("System initialized");
+    LOG_INF("HOLA\n");
 
     unsigned char msg[12] = "Hello World!";
     unsigned char msg_hash[32];
@@ -24,21 +38,86 @@ int main(void) {
     int is_signature_valid;
     int return_val;
 
+    /* secp256k1 context used to sign and verify signatures */
     secp256k1_context *sign_verify_ctx;
 
+    /* This example uses a centralized trusted dealer to generate keys. Alternatively,
+     * FROST provides functions to run distributed key generation. See modules/frost/tests_impl.h */
     secp256k1_frost_vss_commitments *dealer_commitments;
-    secp256k1_frost_keygen_secret_share shares_by_participant[N];
-    secp256k1_frost_keypair keypairs[N];
-    secp256k1_frost_pubkey public_keys[N];
-    secp256k1_frost_signature_share signature_shares[N];
-    secp256k1_frost_nonce *nonces[N];
-    secp256k1_frost_nonce_commitment signing_commitments[N];
+    secp256k1_frost_keygen_secret_share shares_by_participant[3];
+    /* keypairs stores private and public keys for each participant */
+    secp256k1_frost_keypair keypairs[EXAMPLE_MAX_PARTICIPANTS];
+    /* public_keys stores only public keys for each participant (this info can/should be shared among signers) */
+    secp256k1_frost_pubkey public_keys[EXAMPLE_MAX_PARTICIPANTS];
+    secp256k1_frost_signature_share signature_shares[EXAMPLE_MAX_PARTICIPANTS];
+    secp256k1_frost_nonce *nonces[EXAMPLE_MAX_PARTICIPANTS];
+    secp256k1_frost_nonce_commitment signing_commitments[EXAMPLE_MAX_PARTICIPANTS];
 
-    LOG_INF("Initializing context...\n");
+    /*** Initialization ***/
     sign_verify_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    if (!sign_verify_ctx) {
-        printf("Failed to create context!\n");
-        return 1;
+    LOG_INF("Context created\n");
+
+    /*** Key Generation ***/
+    LOG_INF("Starting Key Generation\n");
+    dealer_commitments = secp256k1_frost_vss_commitments_create(2);
+    LOG_INF("Commitments created\n");
+    return_val = secp256k1_frost_keygen_with_dealer(sign_verify_ctx, dealer_commitments,
+                                                shares_by_participant, keypairs,
+                                                EXAMPLE_MAX_PARTICIPANTS, EXAMPLE_MIN_PARTICIPANTS); //Problem here
+    LOG_INF("Values created\n");
+    assert(return_val == 1);
+
+    /* Extracting public_keys from keypair. This operation is intended to be executed by each signer.  */
+    for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
+        LOG_INF("Participant #%d", index);
+        secp256k1_frost_pubkey_from_keypair(&public_keys[index], &keypairs[index]);
+        log_hex("Secret Key", keypairs[index].secret, sizeof(keypairs[index].secret));
+        log_hex("Public Key", keypairs[index].public_keys.public_key, sizeof(keypairs[index].public_keys.public_key));
     }
-    LOG_INF("Context created successfully.\n");
+
+    log_hex("Group Public Key", keypairs[0].public_keys.group_public_key, sizeof(keypairs[0].public_keys.group_public_key));
+
+    /*** Signing ***/
+    /* In FROST, each signer needs to generate a nonce for each signature to compute. A nonce commitment is
+     * exchanged among signers to prevent forgery of signature aggregations. */
+
+    /* Nonce:
+     * Participants to the signing process generate a new nonce and share the related commitment */
+    for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
+
+        /* Generate 32 bytes of randomness to use for computing the nonce. */
+        if (!fill_random(binding_seed, sizeof(binding_seed))) {
+            LOG_INF("Failed to generate binding_seed\n");
+            return 1;
+        }
+        if (!fill_random(hiding_seed, sizeof(hiding_seed))) {
+            LOG_INF("Failed to generate hiding_seed\n");
+            return 1;
+        }
+
+        /* Create the nonce (the function already computes its commitment) */
+        nonces[index] = secp256k1_frost_nonce_create(sign_verify_ctx, &keypairs[index],
+                                                     binding_seed, hiding_seed);
+        /* Copying secp256k1_frost_nonce_commitment to a shared array across participants */
+        memcpy(&signing_commitments[index], &(nonces[index]->commitments), sizeof(secp256k1_frost_nonce_commitment));
+    }
+
+    /* Instead of signing (possibly very long) messages directly, we sign a 32-byte hash of the message.
+     * We use secp256k1_tagged_sha256 to create this hash.  */
+    return_val = secp256k1_tagged_sha256(sign_verify_ctx, msg_hash, tag, sizeof(tag), msg, sizeof(msg));
+    assert(return_val == 1);
+
+    /* Signature Share:
+     * At least EXAMPLE_MIN_PARTICIPANTS participants compute a signature share. These
+     * signature shares will be then aggregated to compute a single FROST signature. */
+    for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
+        /* The secp256k1_frost_sign function provides a simple interface for signing 32-byte messages
+         * (which in our case is a hash of the actual message).
+         * Besides the message (msg_hash in this case), the function requires the number of other signers,
+         * the private signer keypair and nonce, and the public signing commitments of other participants.
+         */
+        return_val = secp256k1_frost_sign(&(signature_shares[index]), msg_hash, EXAMPLE_MIN_PARTICIPANTS,
+                             &keypairs[index], nonces[index], signing_commitments);
+        assert(return_val == 1);
+    }
 }
