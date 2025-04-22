@@ -26,7 +26,7 @@ static void log_hex(const char *label, const uint8_t *data, size_t len) {
 
 int main(void) {
 
-    LOG_INF("HOLA\n");
+    LOG_INF("Starting");
 
     unsigned char msg[12] = "Hello World!";
     unsigned char msg_hash[32];
@@ -55,16 +55,16 @@ int main(void) {
 
     /*** Initialization ***/
     sign_verify_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    LOG_INF("Context created\n");
+    LOG_INF("Context created");
 
     /*** Key Generation ***/
-    LOG_INF("Starting Key Generation\n");
+    LOG_INF("Starting Key Generation");
     dealer_commitments = secp256k1_frost_vss_commitments_create(2);
-    LOG_INF("Commitments created\n");
+    LOG_INF("Commitments created");
     return_val = secp256k1_frost_keygen_with_dealer(sign_verify_ctx, dealer_commitments,
                                                 shares_by_participant, keypairs,
                                                 EXAMPLE_MAX_PARTICIPANTS, EXAMPLE_MIN_PARTICIPANTS); //Problem here
-    LOG_INF("Values created\n");
+    LOG_INF("Values created");
     assert(return_val == 1);
 
     /* Extracting public_keys from keypair. This operation is intended to be executed by each signer.  */
@@ -87,11 +87,11 @@ int main(void) {
 
         /* Generate 32 bytes of randomness to use for computing the nonce. */
         if (!fill_random(binding_seed, sizeof(binding_seed))) {
-            LOG_INF("Failed to generate binding_seed\n");
+            LOG_INF("Failed to generate binding_seed");
             return 1;
         }
         if (!fill_random(hiding_seed, sizeof(hiding_seed))) {
-            LOG_INF("Failed to generate hiding_seed\n");
+            LOG_INF("Failed to generate hiding_seed");
             return 1;
         }
 

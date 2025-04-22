@@ -10,6 +10,7 @@
  #include "fill_random.h"
  #include "../../../include/secp256k1.h"
  #include "../../../include/secp256k1_frost.h"
+ #include <zephyr/kernel.h>
  
  static const unsigned char hash_context_prefix_h1[29] = "FROST-secp256k1-SHA256-v11rho";
  static const unsigned char hash_context_prefix_h3[31] = "FROST-secp256k1-SHA256-v11nonce";
@@ -149,7 +150,9 @@
       */
      unsigned char seed[SCALAR_SIZE];
      ssize_t res;
+     printk("Generating random scalar\n");
      res = fill_random(seed, SCALAR_SIZE);
+     printk("Random scalar generated\n");
      if (res != 1) {
          return 0;
      }
@@ -781,25 +784,37 @@
      secp256k1_scalar secret;
      secp256k1_gej group_public_key;
      uint32_t generator_index, index;
- 
+
+     printk("Starting keygen with dealer\n");
+            
      if (ctx == NULL || share_commitment == NULL || shares == NULL || keypairs == NULL) {
+         printk("NULL parameter detected\n");
          return 0;
      }
+     printk("No NULL\n");
  
      /* We use generator_index=0 as we are generating shares with a dealer */
      generator_index = 0;
+     printk("Generator index started at 0\n");
  
      /* Parameter checking */
      if (threshold < 1 || num_participants < 1 || threshold > num_participants) {
+         printk("Wrong parameter detected\n");
          return 0;
      }
+     printk("No wrong parameter\n");
  
      /* Initialization */
+     printk("Assinging value to index\n");
      share_commitment->index = generator_index;
-     if (initialize_random_scalar(&secret) == 0) {
+     printk("Value assigned\n");
+     if (initialize_random_scalar(&secret) == 0) { //Problem here
+         printk("Wrong secret\n");
          return 0;
      }
+     printk("No wrong secret\n");
      secp256k1_ecmult_gen(&ctx->ecmult_gen_ctx, &group_public_key, &secret);
+     printk("ecmult_gen performed\n");
  
      /* Generate shares */
      if (generate_shares(ctx, share_commitment, shares, num_participants,

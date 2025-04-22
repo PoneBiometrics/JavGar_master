@@ -13,6 +13,16 @@
         "expected": "c",
         "xlocale": "c",
         "*.s": "c",
-        "log.h": "c"
+        "log.h": "c",
+        "stdint.h": "c",
+        "kernel.h": "c",
+        "array": "cpp",
+        "ranges": "cpp",
+        "span": "cpp",
+        "vector": "cpp",
+        "xstring": "cpp",
+        "xutility": "cpp",
+        "string": "cpp",
+        "string_view": "cpp"
     }
 }
