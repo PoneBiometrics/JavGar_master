@@ -76,30 +76,28 @@ static int fill_random(unsigned char* data, size_t size) {
         return 0;
     }
 #elif defined(__ZEPHYR__)
+    // printk("Generating random bytes with Zephyr\n");
+    // const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_entropy));
+    // printk("Device defined\n");
+    // if (!device_is_ready(dev)) {
+    //     printk("Device not ready!\n");
+    //     return 0;
+    // }
+    // printk("Device ready!\n");
+    // if (entropy_get_entropy(dev, data, size) != 0) {
+    //     printk("entropy_get_entropy failed: %d\n", errno);
+    //     return 0;
+    // }
+    // printk("entropy_get_entropy succeeded.\n");
+    // return 1;
     printk("Generating random bytes with Zephyr\n");
-    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_entropy));
-    printk("Device defined\n");
-    if (!device_is_ready(dev)) {
-        printk("Device not ready!\n");
-        return 0;
+    printk("Trying sys_csrand_get\n");
+    int res = sys_csrand_get(data, size);
+    printk("sys_csrand_get returned: %d\n", res);
+    if (res == 0) {
+        printk("Random data generated successfully with sys_rand_get\n");
+        return 1;
     }
-    printk("Device ready!\n");
-    if (entropy_get_entropy(dev, data, size) != 0) {
-        printk("entropy_get_entropy failed: %d\n", errno);
-        return 0;
-    }
-    printk("entropy_get_entropy succeeded.\n");
-    return 1;
 #endif
     return 0;
 }
-
-// #pragma once
-
-// #include <zephyr/random/random.h>
-// #include <stddef.h>
-
-// static int fill_random(unsigned char* data, size_t size) {
-//     /* Zephyr's cryptographic-safe RNG */
-//     return (sys_csrand_get(data, size) == 0) ? 1 : 0;
-// }
