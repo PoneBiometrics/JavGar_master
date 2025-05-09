@@ -4,12 +4,16 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/storage/flash_map.h>
 #include <string.h>
 #include <stdint.h>
 
 //REMEMBER TO CHANGE THE COM IN THE SENDER TOO
 #define UART_NODE DT_NODELABEL(usart1) // usart1 if attaching a new USB in the pins, yellow to D8 and orange to D2 (using COM different to COM3) or usart2 if using COM3 (in this case not possible to debug at the same time)
 #define RX_BUF_SIZE 2048
+
+#define STORAGE_PARTITION     storage_partition
 
 LOG_MODULE_REGISTER(uart_receiver, LOG_LEVEL_INF);
 
@@ -98,6 +102,71 @@ void uart_processing_thread(void)
             hex_buf[128] = '\0';
             LOG_INF("Public Key: %s", hex_buf);
 
+            const struct flash_area *fa;
+            int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
+            if (rc < 0) {
+                LOG_ERR("Failed to open flash area (%d)", rc);
+                return;
+            }
+
+            // Erase sector(s)
+            const struct device *flash_dev = flash_area_get_device(fa);
+            if (!device_is_ready(flash_dev)) {
+                LOG_ERR("Flash device not ready");
+                flash_area_close(fa);
+                return;
+            }
+
+            // Use flash_get_page_info_by_offs() to get erase block size
+            struct flash_pages_info info;
+            rc = flash_get_page_info_by_offs(flash_dev, fa->fa_off, &info);
+            if (rc != 0) {
+                LOG_ERR("Failed to get flash page info (%d)", rc);
+                flash_area_close(fa);
+                return;
+            }
+
+            size_t erase_size = info.size;
+            size_t aligned_erase_size = ROUND_UP(sizeof(struct participant_data), erase_size);
+
+            // Erase flash area at offset 0, aligned to erase block
+            rc = flash_area_erase(fa, 0, aligned_erase_size);
+            if (rc != 0) {
+                LOG_ERR("Failed to erase flash (%d)", rc);
+                flash_area_close(fa);
+                return;
+            }
+
+            // Write data
+            size_t write_block_size = flash_get_write_block_size(flash_dev);
+            size_t padded_size = ROUND_UP(sizeof(struct participant_data), write_block_size);
+
+            uint8_t padded_buf[padded_size];
+            memset(padded_buf, 0xFF, padded_size);
+            memcpy(padded_buf, received_data, sizeof(struct participant_data));
+
+            rc = flash_area_write(fa, 0, padded_buf, padded_size);
+
+            if (rc != 0) {
+                LOG_ERR("Failed to write to flash (%d)", rc);
+                flash_area_close(fa);
+                return;
+            }
+
+            LOG_INF("Data written to flash.");
+
+            struct participant_data read_back;
+            rc = flash_area_read(fa, 0, &read_back, sizeof(struct participant_data));
+            if (rc != 0) {
+                LOG_ERR("Failed to read back data from flash (%d)", rc);
+            } else if (memcmp(&read_back, received_data, sizeof(struct participant_data)) == 0) {
+                LOG_INF("Flash verification succeeded.");
+            } else {
+                LOG_ERR("Flash verification failed: data mismatch.");
+            }
+
+            flash_area_close(fa);
+
             k_free(item);  // Free allocated memory
         }
     }
@@ -133,4 +202,53 @@ void main(void)
     uart_irq_rx_enable(uart_dev);
 
     printk("UART receiver initialized. Waiting for data...\n");
+
+    const struct flash_area *fa;
+    int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
+    if (rc != 0) {
+        printk("Failed to open flash area (%d)\n", rc);
+        return;
+    }
+
+    const struct device *flash_dev = flash_area_get_device(fa);
+    if (!device_is_ready(flash_dev)) {
+        printk("Flash device not ready\n");
+        flash_area_close(fa);
+        return;
+    }
+
+    // Read back stored data
+    struct participant_data flash_data;
+    rc = flash_area_read(fa, 0, &flash_data, sizeof(struct participant_data));
+    if (rc != 0) {
+        printk("Failed to read flash: %d\n", rc);
+    } else {
+        printk("=== Flash Content ===\n");
+        printk("Receiver Index: %d\n", flash_data.receiver_index);
+        printk("Key Index: %d\n", flash_data.key_index);
+        printk("Max Participants: %d\n", flash_data.max_participants);
+
+        char hex_buf[129];
+
+        for (int i = 0; i < 32; i++) {
+            sprintf(&hex_buf[i * 2], "%02x", flash_data.secret_share[i]);
+        }
+        hex_buf[64] = '\0';
+        printk("Secret Share: %s\n", hex_buf);
+
+        for (int i = 0; i < 33; i++) {
+            sprintf(&hex_buf[i * 2], "%02x", flash_data.group_public_key[i]);
+        }
+        hex_buf[66] = '\0';
+        printk("Group Public Key: %s\n", hex_buf);
+
+        for (int i = 0; i < 64; i++) {
+            sprintf(&hex_buf[i * 2], "%02x", flash_data.public_key[i]);
+        }
+        hex_buf[128] = '\0';
+        printk("Public Key: %s\n", hex_buf);
+    }
+
+    flash_area_close(fa);
+
 }

@@ -103,9 +103,8 @@ static int fill_random(unsigned char* data, size_t size) {
     //     printk("sys_csrand_get failed: %d\n", errno);
     //     return 0;
     // }
-    printk("Generating random bytes with Zephyr\n");
+    
     sys_rand_get(data, size);
-    printk("sys_rand_get ok\n");
     return 1;
 #endif
     return 0;
