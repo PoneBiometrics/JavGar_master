@@ -38,6 +38,7 @@
 #elif defined(__ZEPHYR__)
 #include <zephyr/device.h>
 #include <zephyr/drivers/entropy.h>
+#include <zephyr/random/random.h>
 
 #include <zephyr/random/random.h>
 #else
@@ -90,14 +91,22 @@ static int fill_random(unsigned char* data, size_t size) {
     // }
     // printk("entropy_get_entropy succeeded.\n");
     // return 1;
+
+    // printk("Generating random bytes with Zephyr\n");
+    // printk("Trying sys_csrand_get\n");
+    // int res = sys_csrand_get(data, size);
+    // if (res == 0) {
+    //     printk("Random data generated successfully with sys_rand_get\n");
+    //     return 1;
+    // }
+    // else {
+    //     printk("sys_csrand_get failed: %d\n", errno);
+    //     return 0;
+    // }
     printk("Generating random bytes with Zephyr\n");
-    printk("Trying sys_csrand_get\n");
-    int res = sys_csrand_get(data, size);
-    printk("sys_csrand_get returned: %d\n", res);
-    if (res == 0) {
-        printk("Random data generated successfully with sys_rand_get\n");
-        return 1;
-    }
+    sys_rand_get(data, size);
+    printk("sys_rand_get ok\n");
+    return 1;
 #endif
     return 0;
 }

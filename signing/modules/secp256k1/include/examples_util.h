@@ -33,6 +33,7 @@
 #elif defined(__ZEPHYR__)
 #include <zephyr/device.h>
 #include <zephyr/drivers/entropy.h>
+#include <zephyr/random/random.h>
 #else
 #error "Couldn't identify the OS"
 #endif
@@ -69,11 +70,18 @@ static int fill_random(unsigned char* data, size_t size) {
         return 0;
     }
 #elif defined(__ZEPHYR__)
-    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_entropy));
-    if (!device_is_ready(dev)) {
-        return 0;
-    }
-    return entropy_get_entropy(dev, data, size) == 0 ? 1 : 0;
+    // int res = sys_csrand_get(data, size);
+    // if (res == 0) {
+    //     printk("Random data generated successfully with sys_rand_get\n");
+    //     return 1;
+    // }
+    // else {
+    //     return 0;
+    // }
+    printk("Generating random bytes with Zephyr\n");
+    sys_rand_get(data, size);
+    printk("sys_rand_get ok\n");
+    return 1;
 #endif
     return 0;
 }

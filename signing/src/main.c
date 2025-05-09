@@ -98,6 +98,10 @@ int main(void) {
         /* Create the nonce (the function already computes its commitment) */
         nonces[index] = secp256k1_frost_nonce_create(sign_verify_ctx, &keypairs[index],
                                                      binding_seed, hiding_seed);
+
+        log_hex("Nonce hiding commitment", nonces[index]->commitments.hiding, sizeof(nonces[index]->commitments.hiding));
+        log_hex("Nonce binding commitment", nonces[index]->commitments.binding, sizeof(nonces[index]->commitments.binding));
+
         /* Copying secp256k1_frost_nonce_commitment to a shared array across participants */
         memcpy(&signing_commitments[index], &(nonces[index]->commitments), sizeof(secp256k1_frost_nonce_commitment));
     }
@@ -120,4 +124,25 @@ int main(void) {
                              &keypairs[index], nonces[index], signing_commitments);
         assert(return_val == 1);
     }
+
+    /*** Aggregation ***/
+
+    /* A single entity can aggregate all signature shares. Otherwise, each participant can collect
+     * and aggregate all signature shares by the other participants to the signing protocol.
+     * We assume participant with index = 0 is aggregating the signature shares to compute the
+     * FROST signature. */
+    return_val = secp256k1_frost_aggregate(sign_verify_ctx, signature, msg_hash,
+        &keypairs[0], public_keys, signing_commitments,
+        signature_shares, EXAMPLE_MIN_PARTICIPANTS);
+    assert(return_val == 1);
+
+    /*** Verification ***/
+    /* Verify a signature. This will return 1 if it's valid and 0 if it's not. */
+    is_signature_valid = secp256k1_frost_verify(sign_verify_ctx, signature, msg_hash, &keypairs[0].public_keys);
+
+    LOG_INF("Is signature valid? %s", is_signature_valid ? "true" : "false");
+
+    /* Log final values */
+    log_hex("Group Public Key", keypairs[0].public_keys.group_public_key, sizeof(keypairs[0].public_keys.group_public_key));
+    log_hex("Final Signature", signature, sizeof(signature));
 }

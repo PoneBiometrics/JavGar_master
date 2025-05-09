@@ -204,7 +204,7 @@ int main(void) {
         printf("Connect the device and press Enter...");
         getchar(); // Wait for user to connect each device sequentially
     
-        HANDLE hSerial = CreateFile("COM6", // Change this value depending on the port that is going to be used for the communication
+        HANDLE hSerial = CreateFile("COM4", // Change this value depending on the port that is going to be used for the communication
             GENERIC_WRITE,
             0,
             NULL,

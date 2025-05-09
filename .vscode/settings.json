@@ -23,6 +23,26 @@
         "xstring": "cpp",
         "xutility": "cpp",
         "string": "cpp",
-        "string_view": "cpp"
-    }
+        "string_view": "cpp",
+        "cerrno": "cpp",
+        "entropy.h": "c",
+        "bitset": "cpp",
+        "deque": "cpp",
+        "format": "cpp",
+        "initializer_list": "cpp",
+        "list": "cpp",
+        "queue": "cpp",
+        "random": "cpp",
+        "regex": "cpp",
+        "stack": "cpp",
+        "stacktrace": "cpp",
+        "utility": "cpp",
+        "valarray": "cpp",
+        "xhash": "cpp",
+        "xtree": "cpp",
+        "rope": "cpp",
+        "slist": "cpp"
+    },
+    "cortex-debug.gdbPath": "C:/gcc-arm-none-eabi/bin/arm-none-eabi-gdb",
+    "cortex-debug.openocdPath": "C:/openocd/bin/openocd"
 }

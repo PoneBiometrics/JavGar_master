@@ -4,10 +4,10 @@
       "rel_path": "receive_usb",
       "name": "receive_usb",
       "buildConfigs": {
-        "build\\offpad": {
-          "board": "offpad",
-          "relBoardSubDir": "st\\offpad",
-          "name": "build\\offpad",
+        "build\\nucleo_l476rg": {
+          "board": "nucleo_l476rg",
+          "relBoardSubDir": "st\\nucleo_l476rg",
+          "name": "build\\nucleo_l476rg",
           "westBuildArgs": "",
           "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
           "confFiles": {
@@ -118,7 +118,8 @@
               "name": "stm32cubeprogrammer",
               "args": ""
             }
-          }
+          },
+          "launchTarget": "Cortex Debug"
         }
       },
       "confFiles": {

@@ -2,27 +2,19 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Zephyr Debug (OpenOCD)",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/zephyr/zephyr.elf",
+            "executable": "./signing/build/nucleo_l476rg/zephyr/zephyr.elf",
+            "name": "Cortex Debug",
             "request": "launch",
             "type": "cortex-debug",
-            "runToEntryPoint": "main",
             "servertype": "openocd",
-            "device": "nucleo_l476rg",  
-            "interface": "swd",
-
-            // Optional: full path to openocd if not in PATH
-            "serverpath": "C:/msys64/mingw64/bin/openocd.exe", 
-
-            // Use config files matching your board/MCU
             "configFiles": [
-                "interface/stlink.cfg",         // For ST-Link; change if using a different probe
-                "target/stm32f4x.cfg"           // Match to your STM32 family (e.g., stm32f1x.cfg)
+                "C:/openocd/openocd/scripts/interface/stlink.cfg",
+                "C:/openocd/openocd/scripts/target/stm32l4x.cfg"
             ],
-
-            // Optional: if you want verbose debug server output
-            // "showDevDebugOutput": true
+            "searchDir": [],
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none"
         }
     ]
 }

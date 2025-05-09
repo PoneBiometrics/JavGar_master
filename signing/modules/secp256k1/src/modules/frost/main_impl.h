@@ -152,7 +152,8 @@
      ssize_t res;
      printk("Generating random scalar\n");
      res = fill_random(seed, SCALAR_SIZE);
-     printk("Random scalar generated\n");
+    //  memset(seed, 0, SCALAR_SIZE);
+    //  printk("Random scalar generated\n");
      if (res != 1) {
          return 0;
      }
