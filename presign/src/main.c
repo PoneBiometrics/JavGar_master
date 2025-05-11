@@ -59,9 +59,6 @@ int main(void) {
     secp256k1_frost_keypair keypairs[N];
     /* public_keys stores only public keys for each participant (this info can/should be shared among signers) */
     secp256k1_frost_pubkey public_keys[N];
-    secp256k1_frost_signature_share signature_shares[N];
-    secp256k1_frost_nonce *nonces[N];
-    secp256k1_frost_nonce_commitment signing_commitments[N];
 
     /*** INITIALIZATION OF CONTEXT ***/
     printf("Initializing context...\n");
@@ -248,6 +245,16 @@ int main(void) {
             uint32_t max_participants;
         } ParticipantData;
         #pragma pack(pop)
+
+        #pragma pack(push, 1)
+        typedef struct {
+            uint32_t index;
+            uint32_t num_coefficients;
+            uint8_t zkp_z[32];
+            uint8_t zkp_r[64];
+            uint8_t coefficients[T][33]; // T is the threshold
+        } DealerCommitmentsData;
+        #pragma pack(pop)
     
         ParticipantData data;
         data.receiver_index = shares_by_participant[i].receiver_index;
@@ -256,9 +263,24 @@ int main(void) {
         memcpy(data.group_public_key, keypairs[i].public_keys.group_public_key, 33);
         data.key_index = keypairs[i].public_keys.index;
         data.max_participants = keypairs[i].public_keys.max_participants;
+
+        printf("Sending dealer commitments...\n");
+        DealerCommitmentsData d_data;
+        d_data.index = dealer_commitments->index;
+        d_data.num_coefficients = dealer_commitments->num_coefficients;
+        memcpy(d_data.zkp_z, dealer_commitments->zkp_z, 32);
+        memcpy(d_data.zkp_r, dealer_commitments->zkp_r, 64);
+        for (uint32_t j = 0; j < T; j++) {
+            memcpy(d_data.coefficients[j], dealer_commitments->coefficient_commitments[j].data, 33);
+        }
+
+        // Send it over serial
+        DWORD bytesWritten;
+        WriteFile(hSerial, &d_data, sizeof(d_data), &bytesWritten, NULL);
+        CloseHandle(hSerial);
+        printf("Dealer commitments sent.\n");
     
         // Send data
-        DWORD bytesWritten;
         if (!WriteFile(hSerial, &data, sizeof(data), &bytesWritten, NULL)) {
             printf("Write failed. Error: %lu\n", GetLastError());
             CloseHandle(hSerial);
