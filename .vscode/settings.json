@@ -41,7 +41,16 @@
         "xhash": "cpp",
         "xtree": "cpp",
         "rope": "cpp",
-        "slist": "cpp"
+        "slist": "cpp",
+        "ios": "c",
+        "xiosbase": "c",
+        "charconv": "c",
+        "util.h": "c",
+        "future": "c",
+        "ring_buffer.h": "c",
+        "flash.h": "c",
+        "chrono": "c",
+        "variant": "c"
     },
     "cortex-debug.gdbPath": "C:/gcc-arm-none-eabi/bin/arm-none-eabi-gdb",
     "cortex-debug.openocdPath": "C:/openocd/bin/openocd"

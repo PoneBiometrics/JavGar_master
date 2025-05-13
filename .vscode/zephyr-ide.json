@@ -3,28 +3,7 @@
     "receive_usb": {
       "rel_path": "receive_usb",
       "name": "receive_usb",
-      "buildConfigs": {
-        "build\\nucleo_l476rg": {
-          "board": "nucleo_l476rg",
-          "relBoardSubDir": "st\\nucleo_l476rg",
-          "name": "build\\nucleo_l476rg",
-          "westBuildArgs": "",
-          "westBuildCMakeArgs": " -DCONFIG_NO_OPTIMIZATIONS=y",
-          "confFiles": {
-            "config": [],
-            "extraConfig": [],
-            "overlay": [],
-            "extraOverlay": []
-          },
-          "runnerConfigs": {
-            "stm32cubeprogrammer": {
-              "runner": "stm32cubeprogrammer",
-              "name": "stm32cubeprogrammer",
-              "args": ""
-            }
-          }
-        }
-      },
+      "buildConfigs": {},
       "confFiles": {
         "config": [],
         "extraConfig": [],
@@ -120,6 +99,38 @@
             }
           },
           "launchTarget": "Cortex Debug"
+        }
+      },
+      "confFiles": {
+        "config": [],
+        "extraConfig": [],
+        "overlay": [],
+        "extraOverlay": []
+      }
+    },
+    "receive_usb_offpad": {
+      "rel_path": "receive_usb_offpad",
+      "name": "receive_usb_offpad",
+      "buildConfigs": {
+        "build\\offpad": {
+          "board": "offpad",
+          "relBoardSubDir": "st\\offpad",
+          "name": "build\\offpad",
+          "westBuildArgs": "",
+          "westBuildCMakeArgs": "",
+          "confFiles": {
+            "config": [],
+            "extraConfig": [],
+            "overlay": [],
+            "extraOverlay": []
+          },
+          "runnerConfigs": {
+            "stm32cubeprogrammer": {
+              "runner": "stm32cubeprogrammer",
+              "name": "stm32cubeprogrammer",
+              "args": ""
+            }
+          }
         }
       },
       "confFiles": {
