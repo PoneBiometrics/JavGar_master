@@ -1,0 +1,161 @@
+/dts-v1/;
+#include <st/wb/stm32wb55Xg.dtsi>
+#include <st/wb/stm32wb55cgux-pinctrl.dtsi>
+
+/ {
+	model = "OffPad board";
+	compatible = "offpad";
+
+	chosen {
+		zephyr,console = &lpuart1;
+		zephyr,shell-uart = &lpuart1;
+		zephyr,bt-mon-uart = &lpuart1;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	aliases {
+		sw0 = &button_0;
+	};
+
+	sram0: memory@20000000 {
+		reg = <0x20000000 DT_SIZE_K(256)>;
+		device_type = "memory";
+	};
+};
+
+&rng {
+	status = "okay";
+};
+
+&clk_hse {
+	status = "okay";
+};
+
+&clk_hsi48 {
+	status = "okay";
+};
+
+&rng {
+	status = "okay";
+};
+
+&pll {
+	clocks = <&clk_hse>;
+	status = "okay";
+	div-m = <1>; // base divider, clock / div-m * mul-n = VCO out
+	mul-n = <4>; // base multiplier, 32MHz HSE / 1 * 4 = 128MHz VCO
+	div-p = <2>; // 64MHz PLL_P to I2S
+	div-q = <2>; // 64MHz PLL_Q to RNG
+	div-r = <2>; // 64MHz PLL_R to SYSCLK
+};
+
+&rcc {
+	clocks = <&pll>;
+	clock-frequency = <DT_FREQ_M(64)>;
+	cpu1-prescaler = <1>; // 64MHz CPU1
+	cpu2-prescaler = <2>; // 32MHz CPU2
+	ahb4-prescaler = <1>; // 64MHz Hi-performance Bus
+	apb1-prescaler = <2>; // 32MHz Peripheral Bus
+	apb2-prescaler = <2>;
+};
+
+&rtc {
+	status = "okay";
+};
+
+&lptim1 {
+	clocks = <&rcc STM32_CLOCK_BUS_APB1 0x80000000>,
+			 <&rcc STM32_SRC_LSE LPTIM1_SEL(3)>;
+};
+
+&i2c1 {
+	pinctrl-0 = <&i2c1_scl_pb6 &i2c1_sda_pb7>;
+	pinctrl-names = "default";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	max77734: max77734@48 {
+		compatible = "maxim,max77734";
+		reg = <0x48>;
+		int-gpios = <&gpioa 11 GPIO_ACTIVE_LOW>;
+
+		chg-cc-uA = <15000>;
+		chg-max-cc-uA = <15000>;
+		chg-cv-mV = <4200>;
+		i-term = <150>;
+		/*
+			Therminal values (based on a NTC of 4100K)
+			Hot  = 41,5 deg Celcius
+			Warm = 37,3
+			Cool = 8,3
+			Cold = -0,2
+		*/
+		thm = <0x05>;
+		thm-en;
+		chg-cc-jeita-uA = <7500>;
+		chg-cv-jeita-mV = <4075>;
+		imon-dischg-scale = <0x03>;
+
+		ldo-voltage-mV = <3300>;
+
+		t-topoff = <10>;
+		t-mrst-s = <8>;
+
+		status = "okay";
+	};
+};
+
+&lpuart1 {
+	pinctrl-0 = <&lpuart1_tx_pa2 &lpuart1_rx_pa3>;
+	pinctrl-names = "default";
+	current-speed = <115200>;
+	status = "okay";
+};
+
+&flash0 {
+	/*
+	 * For more information, see:
+	 * https://docs.zephyrproject.org/latest/reference/devicetree/index.html#fixed-flash-partitions
+	 */
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* Set all partitions with first 808K of flash */
+		/* last 216K are reseved for M0 usage */
+		/* Configure partitions to make use of the whole 808K */
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0xC000>;
+		};
+
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000C000 0x3C000>;
+		};
+
+		slot1_partition: partition@48000 {
+			label = "image-1";
+			reg = <0x00048000 0x3C000>;
+		};
+
+		scratch_partition: partition@84000 {
+			label = "image-scratch";
+			reg = <0x00084000 0x4000>;
+		};
+
+		storage_partition: partition@88000 {
+			label = "storage";
+			reg = <0x00088000 0x2000>;
+		};
+
+		fingerprint0_partition: partition@8A000 {
+			label = "fingerprint0";
+			reg = <0x0008A000 0x4000>;
+		};
+	};
+};

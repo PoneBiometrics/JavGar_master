@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_OFFPAD
+	select SOC_STM32WB55XX

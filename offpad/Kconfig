@@ -1,0 +1,15 @@
+config HAS_STPAY_VDD_GPIO
+	bool "Has STPAY Vdd GPIO"
+	default n
+
+config HAS_EXTERNAL_LDO
+	bool "Has external LDO"
+	default n
+
+config SC_WT
+	int "SmartCard WT parameter value"
+	default 983
+
+config SC_ETU
+	int "SmartCard ETU parameter value"
+	default 245750

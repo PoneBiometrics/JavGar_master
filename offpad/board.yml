@@ -1,0 +1,15 @@
+board:
+  name: offpad
+  vendor: arm
+  socs:
+    - name: stm32wb55xx
+  revision:
+    format: custom
+    default: MP2_V1
+    exact: true
+    revisions:
+    - name: MP1_V2
+    - name: MP1_V3
+    - name: MP1_V4
+    - name: MP1_V5
+    - name: MP2_V1
