@@ -1,277 +1,175 @@
-#include <zephyr/device.h>
-#include <zephyr/init.h>
+/*
+ * Copyright (c) 2016-2018 Intel Corporation.
+ * Copyright (c) 2018-2021 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
+#include <zephyr/init.h>
+
 #include <zephyr/usb/usb_device.h>
-/* usb_hid must be included after usb_device. Fixed in v3.6.0 */
 #include <zephyr/usb/class/usb_hid.h>
 
-LOG_MODULE_REGISTER(usb, CONFIG_LOG_DEFAULT_LEVEL);
+#define LOG_LEVEL LOG_LEVEL_INF
+LOG_MODULE_REGISTER(main);
 
-#define BLOCK_SIZE      (64)
-#define QUEUE_ITEM_SIZE (20)
+static bool configured;
+static const struct device *hdev;
+static struct k_work report_send;
+static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
-K_MSGQ_DEFINE(usbSendQueue, BLOCK_SIZE, QUEUE_ITEM_SIZE, 4);
+#define HID_EP_BUSY_FLAG	0
+#define REPORT_ID_1		0x01
+#define REPORT_PERIOD		K_SECONDS(2)
 
-K_MUTEX_DEFINE(workerRunningMutex);
-
-// Define missing types
-typedef struct {
-    void (*data_received)(struct usb_dev_t *dev, uint8_t *data, size_t size, void *user_data);
-} h_usb_callbacks_t;
-
-// Forward declaration
-struct usb_dev_t;
-
-/**
- * @brief Define HID Usage Page item of size two.
- *
- * @param page Usage Page
- * @return     HID Usage Page item
- */
-#define HID_USAGE_PAGE2(page) HID_ITEM(HID_ITEM_TAG_USAGE_PAGE, HID_ITEM_TYPE_GLOBAL, 2), page
-
-#define HID_FIDO_USAGE_PAGE     0xD0, 0xF1
-#define HID_FIDO_USAGE_CTAPHID  0x01
-#define HID_FIDO_USAGE_DATA_IN  0x20
-#define HID_FIDO_USAGE_DATA_OUT 0x21
-#define HID_FIDO_REPORT_COUNT   0x40
-/*
- * HID Report Descriptor
- * Report ID is present for completeness, although it can be omitted.
- * "usbhid-dump -d f1d0:f1d0 -e descriptor"
- */
-static const uint8_t hid_report_desc[] = {
-    HID_USAGE_PAGE2(HID_FIDO_USAGE_PAGE),
-    HID_USAGE(HID_FIDO_USAGE_CTAPHID),
-    HID_COLLECTION(HID_COLLECTION_APPLICATION),
-    HID_USAGE(HID_FIDO_USAGE_DATA_IN),
-    HID_LOGICAL_MIN8(0x00),
-    HID_LOGICAL_MAX16(0xFF, 0x00),
-    HID_REPORT_SIZE(8),
-    HID_REPORT_COUNT(HID_FIDO_REPORT_COUNT),
-    /* HID_INPUT (Data,Var,Abs) */
-    HID_INPUT(0x02),
-    HID_USAGE(HID_FIDO_USAGE_DATA_OUT),
-    HID_LOGICAL_MIN8(0x00),
-    HID_LOGICAL_MAX16(0xFF, 0x00),
-    HID_REPORT_SIZE(8),
-    HID_REPORT_COUNT(HID_FIDO_REPORT_COUNT),
-    /* HID_INPUT (Data,Var,Abs) */
-    HID_OUTPUT(0x02),
-    HID_END_COLLECTION,
+static struct report {
+	uint8_t id;
+	uint8_t value;
+} __packed report_1 = {
+	.id = REPORT_ID_1,
+	.value = 0,
 };
 
-typedef struct usb_dev_t {
-    const struct device *dev;
-    h_usb_callbacks_t callbacks;
-    void *callbackData;
-    struct k_work sendWorker;
-    bool workerRunning;
-    bool configured;
-} usb_dev_t;
+static void report_event_handler(struct k_timer *dummy);
+static K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
 
-static usb_dev_t usb_device;
+/*
+ * Simple HID Report Descriptor
+ * Report ID is present for completeness, although it can be omitted.
+ * Output of "usbhid-dump -d 2fe3:0006 -e descriptor":
+ *  05 01 09 00 A1 01 15 00    26 FF 00 85 01 75 08 95
+ *  01 09 00 81 02 C0
+ */
+static const uint8_t hid_report_desc[] = {
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_ID(REPORT_ID_1),
+	HID_REPORT_SIZE(8),
+	HID_REPORT_COUNT(1),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_INPUT(0x02),
+	HID_END_COLLECTION,
+};
 
-// Stub for missing function - replace with actual implementation if available
-static void send_usb_connection_status(bool connected)
+static void send_report(struct k_work *work)
 {
-    LOG_DBG("USB connection status: %s", connected ? "connected" : "disconnected");
-    // Add your connection status handling here
+	int ret, wrote;
+
+	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		ret = hid_int_ep_write(hdev, (uint8_t *)&report_1,
+				       sizeof(report_1), &wrote);
+		if (ret != 0) {
+			/*
+			 * Do nothing and wait until host has reset the device
+			 * and hid_ep_in_busy is cleared.
+			 */
+			LOG_ERR("Failed to submit report");
+		} else {
+			LOG_DBG("Report submitted");
+		}
+	} else {
+		LOG_DBG("HID IN endpoint busy");
+	}
 }
 
-/**
- * @brief Worker thread function
- *
- * @param work Pointer to worker object
- *
- * This function will "work" until the send queue is empty.
- * When empty it will return and end the work thread.
- */
-static void sendUsbWorker(struct k_work *work)
+static void int_in_ready_cb(const struct device *dev)
 {
-    int res = 0;
-    uint8_t message[BLOCK_SIZE];
-    usb_dev_t *dev = CONTAINER_OF(work, usb_dev_t, sendWorker);
-    if (dev == NULL) {
-        LOG_ERR("no device for usb!!!");
-        return;
-    }
-    memset(message, 0, sizeof(message));
-    k_mutex_lock(&workerRunningMutex, K_FOREVER);
-    res = k_msgq_peek(&usbSendQueue, &message);
-    if (res != 0) {
-        dev->workerRunning = false;
-        k_mutex_unlock(&workerRunningMutex);
-        return;
-    }
-    k_mutex_unlock(&workerRunningMutex);
-
-    int bytes_written;
-    res = k_msgq_get(&usbSendQueue, &message, K_NO_WAIT);
-    if (res != 0) {
-        LOG_ERR("usb send queue should not be empty %u", res);
-        return;
-    }
-    hid_int_ep_write(usb_device.dev, message, sizeof(message), &bytes_written);
+	ARG_UNUSED(dev);
+	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		LOG_WRN("IN endpoint callback without preceding buffer write");
+	}
 }
 
-/**
- * @brief Starts a worker thread (if not already started)
- *
- * @param dev Pointer to dev object to use
+/*
+ * On Idle callback is available here as an example even if actual use is
+ * very limited. In contrast to report_event_handler(),
+ * report value is not incremented here.
  */
-static void startWorker(usb_dev_t *dev)
+static void on_idle_cb(const struct device *dev, uint16_t report_id)
 {
-    k_mutex_lock(&workerRunningMutex, K_FOREVER);
-    if (!dev->workerRunning) {
-        dev->workerRunning = true;
-        k_work_submit(&dev->sendWorker);
-    }
-    k_mutex_unlock(&workerRunningMutex);
+	LOG_DBG("On idle callback");
+	k_work_submit(&report_send);
 }
 
-/**
- * @brief HID read callback
- *
- * @param dev USB dev pointer
- *
- * This function is called by Zephyr when we have new incoming data to handle
- * This data is just pushed up to the application layer.
- */
-static void hidReadCB(const struct device *dev)
+static void report_event_handler(struct k_timer *dummy)
 {
-    if (dev != NULL) {
-        uint8_t message[BLOCK_SIZE];
-        size_t readSize = 0;
-        hid_int_ep_read(dev, (uint8_t *)&message, sizeof(message), &readSize);
-
-        if (usb_device.callbacks.data_received != NULL) {
-            usb_device.callbacks.data_received(&usb_device, message, sizeof(message),
-                                               usb_device.callbackData);
-        }
-    }
+	/* Increment reported data */
+	report_1.value++;
+	k_work_submit(&report_send);
 }
 
-/**
- * @brief HID write callback
- *
- * @param dev USB dev pointer
- *
- * This function is called by Zephyr when a data block is sent
- * and the system is ready to send the next.
- */
-static void hidWriteCB(const struct device *dev)
+static void protocol_cb(const struct device *dev, uint8_t protocol)
 {
-    ARG_UNUSED(dev);
-    k_work_submit(&usb_device.sendWorker);
+	LOG_INF("New protocol: %s", protocol == HID_PROTOCOL_BOOT ?
+		"boot" : "report");
 }
 
 static const struct hid_ops ops = {
-    .int_out_ready = hidReadCB,
-    .int_in_ready = hidWriteCB,
+	.int_in_ready = int_in_ready_cb,
+	.on_idle = on_idle_cb,
+	.protocol_change = protocol_cb,
 };
 
-static void usbStatusCallback(enum usb_dc_status_code status, const uint8_t *param)
+static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
 {
-    switch (status) {
-    case USB_DC_RESET:
-        usb_device.configured = false;
-        break;
-    case USB_DC_CONFIGURED:
-        if (!usb_device.configured) {
-            usb_device.configured = true;
-        }
-        break;
-    case USB_DC_SOF:
-        break;
-    case USB_DC_SUSPEND:
-        send_usb_connection_status(false);
-        LOG_DBG("suspend");
-        break;
-    case USB_DC_RESUME:
-        send_usb_connection_status(true);
-        LOG_DBG("resume");
-        break;
-    default:
-        LOG_DBG("status %u unhandled", status);
-        break;
-    }
+	switch (status) {
+	case USB_DC_RESET:
+		configured = false;
+		break;
+	case USB_DC_CONFIGURED:
+		if (!configured) {
+			int_in_ready_cb(hdev);
+			configured = true;
+		}
+		break;
+	case USB_DC_SOF:
+		break;
+	default:
+		LOG_DBG("status %u unhandled", status);
+		break;
+	}
 }
 
-static int usbPreInit(void)
+int main(void)
 {
-    usb_device.configured = false;
-    usb_device.callbackData = NULL;
-    usb_device.workerRunning = false;
-    usb_device.dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(hid0));
+	int ret;
 
-    if (usb_device.dev == NULL) {
-        LOG_ERR("Cannot get USB HID Device");
-        return -ENODEV;
-    }
+	hdev = device_get_binding("HID_0");
+	if (hdev == NULL) {
+		LOG_ERR("Cannot get USB HID Device");
+		return -ENODEV;
+	}
 
-    LOG_INF("HID Device: dev %p", usb_device.dev);
+	LOG_INF("HID Device: dev %p", hdev);
 
-    usb_hid_register_device(usb_device.dev, hid_report_desc, sizeof(hid_report_desc), &ops);
+	usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc),
+				&ops);
 
-    return usb_hid_init(usb_device.dev);
-}
+	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
 
-int h_usb_initalize(void)
-{
-    int preInitResponse = usbPreInit();
-    if (preInitResponse != 0) {
-        LOG_ERR("PreInit failed %d", preInitResponse);
-        return preInitResponse;
-    }
+	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
+		LOG_WRN("Failed to set Protocol Code");
+	}
 
-    int ret = usb_enable(usbStatusCallback);
-    if (ret != 0) {
-        LOG_ERR("Failed to enable USB");
-        return ret;  // Return actual error code instead of 0
-    }
+	ret = usb_hid_init(hdev);
+	if (ret != 0) {
+		return ret;
+	}
 
-    k_work_init(&usb_device.sendWorker, sendUsbWorker);
+	LOG_INF("Starting application");
 
-    return 0;
-}
+	ret = usb_enable(status_cb);
+	if (ret != 0) {
+		LOG_ERR("Failed to enable USB");
+		return ret;
+	}
 
-usb_dev_t *get_usb_device(void)
-{
-    return &usb_device;
-}
+	k_work_init(&report_send, send_report);
 
-int h_usb_set_callbacks(usb_dev_t *dev, h_usb_callbacks_t *callbacks, void *callback_data)
-{
-    if (dev != NULL && callbacks != NULL) {
-        dev->callbacks.data_received = callbacks->data_received;
-        dev->callbackData = callback_data;
-        return 0;
-    }
-
-    return -1;
-}
-
-int h_usb_send_data(usb_dev_t *dev, const uint8_t *data, const size_t size)
-{
-    if (dev == NULL || data == NULL || size == 0) {
-        return -EINVAL;
-    }
-
-    // Copy data in to zero filled buffer
-    uint8_t msg[BLOCK_SIZE];
-    memset(msg, 0, sizeof(msg));
-    memcpy(msg, data, MIN(size, sizeof(msg)));
-
-    // Copy to queue
-    if (k_msgq_put(&usbSendQueue, msg, K_MSEC(1000)) != 0) {
-        LOG_ERR("send: timeout sending packet");
-        return -ETIMEDOUT;
-    }
-
-    // Start worker
-    startWorker(dev);
-
-    return (int)size;
+	return 0;
 }
