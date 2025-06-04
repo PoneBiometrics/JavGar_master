@@ -1,26 +1,31 @@
+/*
+ * FROST Key Receiver - Zephyr USB HID Implementation
+ * Receives FROST cryptographic key data via USB HID from Windows host
+ */
+
 #include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
-#include <zephyr/sys/ring_buffer.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/drivers/flash.h>
-#include <zephyr/storage/flash_map.h>
+#include <zephyr/init.h>
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/usb/class/usb_hid.h>
 #include <string.h>
-#include <secp256k1.h>
-#include <secp256k1_frost.h>
-#include "examples_util.h"
 
-LOG_MODULE_REGISTER(frost_receiver, LOG_LEVEL_INF);
+#define LOG_LEVEL LOG_LEVEL_INF
+LOG_MODULE_REGISTER(frost_receiver);
 
-#define RING_BUF_SIZE 1024
-#define MAX_MSG_SIZE 512
-#define UART_DEVICE_NODE DT_NODELABEL(lpuart1) //usart1 for nucleo
+static bool configured;
+static const struct device *hdev;
+static struct k_work report_send;
+static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
-// Message protocol definitions - must match sender
+#define HID_EP_BUSY_FLAG	0
+#define REPORT_ID_1		0x01
+#define REPORT_PERIOD		K_SECONDS(2)
+
+// Message protocol constants - MUST match sender
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
 #define MSG_VERSION 0x01
 
-// Message types
+// Message types for the protocol
 typedef enum {
     MSG_TYPE_SECRET_SHARE = 0x01,
     MSG_TYPE_PUBLIC_KEY = 0x02,
@@ -28,310 +33,254 @@ typedef enum {
     MSG_TYPE_END_TRANSMISSION = 0xFF
 } message_type_t;
 
-// Header for each message
+// Header for each message in the protocol
+#pragma pack(push, 1)
 typedef struct {
     uint32_t magic;        // Magic number to identify our protocol
     uint8_t version;       // Protocol version
     uint8_t msg_type;      // Type of message
     uint16_t payload_len;  // Length of payload following the header
-    uint32_t participant;  // Participant ID
-} __packed message_header_t;
+    uint32_t participant;  // Participant ID (1-based)
+} message_header_t;
+#pragma pack(pop)
 
-#define STORAGE_PARTITION     storage_partition
-
-// Serializable version of our FROST structures for flash storage
+// Data structures for received data
+#pragma pack(push, 1)
 typedef struct {
-    // Keypair storage
-    uint32_t keypair_index;
-    uint32_t keypair_max_participants;
-    uint8_t keypair_secret[32];
-    uint8_t keypair_public_key[64];
-    uint8_t keypair_group_public_key[33];
+    uint32_t receiver_index;
+    uint8_t value[32];
+} serialized_share_t;
 
-    // Commitments storage
-    uint32_t commitments_index;
-    uint32_t commitments_num_coefficients;
-    uint8_t commitments_zkp_z[32];
-    uint8_t commitments_zkp_r[64];
-    // Assuming maximum threshold of 10 coefficients
-    uint8_t commitments_coefficient_data[10 * sizeof(secp256k1_frost_vss_commitment)];
-} __packed frost_flash_storage_t;
+typedef struct {
+    uint32_t index;
+    uint32_t max_participants;
+    uint8_t public_key[64];
+    uint8_t group_public_key[33];
+} serialized_pubkey_t;
+#pragma pack(pop)
 
-// FROST Key structures
-static secp256k1_context *ctx;
-static secp256k1_frost_keypair keypair;
-static secp256k1_frost_vss_commitments *commitments;
+// Storage for received data
+static struct {
+    bool has_secret_share;
+    bool has_public_key;
+    bool has_commitments;
+    bool transmission_complete;
+    
+    serialized_share_t secret_share;
+    serialized_pubkey_t public_key;
+    
+    // Commitments data (variable size)
+    uint32_t commitment_index;
+    uint32_t num_coefficients;
+    uint8_t zkp_z[32];
+    uint8_t zkp_r[64];
+    uint8_t *coefficient_commitments;
+    size_t coefficient_commitments_size;
+    
+    uint32_t participant_id;
+} received_data = {0};
 
-// Communication buffers
-static uint8_t rx_buf[RING_BUF_SIZE];
-static struct ring_buf rx_ring_buf;
-static const struct device *uart_dev;
+// Buffer for assembling incoming data
+static uint8_t receive_buffer[2048];  // Increased buffer size
+static size_t receive_buffer_pos = 0;
+static size_t expected_message_size = 0;
+static bool receiving_message = false;
 
-// Receive state
-typedef enum {
-    WAITING_FOR_HEADER,
-    WAITING_FOR_PAYLOAD
-} receive_state_t;
+static struct report {
+	uint8_t id;
+	uint8_t value;
+} __packed report_1 = {
+	.id = REPORT_ID_1,
+	.value = 0,
+};
 
-static receive_state_t rx_state = WAITING_FOR_HEADER;
-static message_header_t current_header;
-static uint8_t payload_buffer[MAX_MSG_SIZE];
-static size_t payload_bytes_received = 0;
+static void report_event_handler(struct k_timer *dummy);
+static K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
+
+/*
+ * Enhanced HID Report Descriptor for bidirectional communication
+ * Supports both input and output reports for receiving data from host
+ */
+static const uint8_t hid_report_desc[] = {
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+	
+	// Input report (device to host) - for status/acknowledgments
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_ID(0x01),
+	HID_REPORT_SIZE(8),
+	HID_REPORT_COUNT(1),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_INPUT(0x02),
+	
+	// Output report (host to device) - for receiving FROST data
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_ID(0x02),
+	HID_REPORT_SIZE(8),
+	HID_REPORT_COUNT(64),  // 64-byte reports to match sender
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_OUTPUT(0x02),
+	
+	HID_END_COLLECTION,
+};
 
 // Helper function to print hex data
-void log_hex_bytes(const char *label, const unsigned char *data, size_t len) {
-    char hex_buf[3 * MAX_MSG_SIZE + 1];
-    size_t pos = 0;
-
-    for (size_t i = 0; i < len && pos < sizeof(hex_buf) - 3; i++) {
-        pos += snprintk(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", data[i]);
+static void print_hex(const char *label, const uint8_t *data, size_t len) {
+    LOG_INF("%s:", label);
+    for (size_t i = 0; i < len; i++) {
+        printk("%02x", data[i]);
+        if ((i + 1) % 16 == 0) {
+            printk("\n");
+        } else if ((i + 1) % 8 == 0) {
+            printk("  ");
+        } else {
+            printk(" ");
+        }
     }
-
-    hex_buf[pos] = '\0';
-    LOG_INF("%s: %s", label, hex_buf);
+    if (len % 16 != 0) {
+        printk("\n");
+    }
 }
 
-// Function to write FROST key material to flash
-int write_frost_data_to_flash(void) {
-    const struct flash_area *fa;
-    int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
-    if (rc < 0) {
-        LOG_ERR("Failed to open flash area (%d)", rc);
-        return rc;
-    }
-
-    // Prepare serializable storage structure
-    frost_flash_storage_t flash_data = {0};
-
-    // Fill keypair data
-    flash_data.keypair_index = keypair.public_keys.index;
-    flash_data.keypair_max_participants = keypair.public_keys.max_participants;
-    memcpy(flash_data.keypair_secret, keypair.secret, 32);
-    memcpy(flash_data.keypair_public_key, keypair.public_keys.public_key, 64);
-    memcpy(flash_data.keypair_group_public_key, keypair.public_keys.group_public_key, 33);
-
-    // Get flash device details
-    const struct device *flash_dev = flash_area_get_device(fa);
-    if (!device_is_ready(flash_dev)) {
-        LOG_ERR("Flash device not ready");
-        flash_area_close(fa);
-        return -1;
-    }
-
-    // Get erase block size
-    struct flash_pages_info info;
-    rc = flash_get_page_info_by_offs(flash_dev, fa->fa_off, &info);
-    if (rc != 0) {
-        LOG_ERR("Failed to get flash page info (%d)", rc);
-        flash_area_close(fa);
-        return rc;
-    }
-
-    // Erase flash sector
-    size_t erase_size = ROUND_UP(sizeof(frost_flash_storage_t), info.size);
-    rc = flash_area_erase(fa, 0, erase_size);
-    if (rc != 0) {
-        LOG_ERR("Failed to erase flash (%d)", rc);
-        flash_area_close(fa);
-        return rc;
-    }
-
-    // Prepare padded write buffer
-    size_t write_block_size = flash_get_write_block_size(flash_dev);
-    size_t padded_size = ROUND_UP(sizeof(frost_flash_storage_t), write_block_size);
-    uint8_t padded_buf[padded_size];
-    memset(padded_buf, 0xFF, padded_size);
-    memcpy(padded_buf, &flash_data, sizeof(frost_flash_storage_t));
-
-    // Write to flash
-    rc = flash_area_write(fa, 0, padded_buf, padded_size);
-    if (rc != 0) {
-        LOG_ERR("Failed to write to flash (%d)", rc);
-        flash_area_close(fa);
-        return rc;
-    }
-
-    LOG_INF("FROST key material written to flash.");
-    flash_area_close(fa);
-    return 0;
-}
-
-// Function to read and log FROST key material from flash
-int read_frost_data_from_flash(void) {
-    const struct flash_area *fa;
-    int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
-    if (rc < 0) {
-        LOG_ERR("Failed to open flash area (%d)", rc);
-        return rc;
-    }
-
-    // Read back stored data
-    frost_flash_storage_t flash_data;
-    rc = flash_area_read(fa, 0, &flash_data, sizeof(frost_flash_storage_t));
-    if (rc != 0) {
-        LOG_ERR("Failed to read flash: %d", rc);
-        flash_area_close(fa);
-        return rc;
-    }
-
-    // Log keypair information
-    LOG_INF("=== Stored Keypair ===");
-    LOG_INF("Participant Index: %d", flash_data.keypair_index);
-    LOG_INF("Max Participants: %d", flash_data.keypair_max_participants);
-    
-    // Log secret and public keys in hex
-    char hex_buf[129];
-    for (int i = 0; i < 32; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_secret[i]);
-    }
-    hex_buf[64] = '\0';
-    LOG_INF("Secret Share: %s", hex_buf);
-
-    for (int i = 0; i < 64; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_public_key[i]);
-    }
-    hex_buf[128] = '\0';
-    LOG_INF("Public Key: %s", hex_buf);
-
-    for (int i = 0; i < 33; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_group_public_key[i]);
-    }
-    hex_buf[66] = '\0';
-    LOG_INF("Group Public Key: %s", hex_buf);
-
-    flash_area_close(fa);
-    return 0;
-}
-
-// Process a secret share message
-static void process_secret_share(const uint8_t *payload, uint16_t len) {
-    if (len != sizeof(uint32_t) + 32) {
-        LOG_ERR("Invalid secret share payload size: %d", len);
+// Function to process a complete message
+static void process_message(const uint8_t *data, size_t len) {
+    if (len < sizeof(message_header_t)) {
+        LOG_ERR("Message too short for header: %zu bytes", len);
         return;
     }
     
-    // Extract receiver index and share value
-    uint32_t receiver_index;
-    memcpy(&receiver_index, payload, sizeof(uint32_t));
+    const message_header_t *header = (const message_header_t *)data;
+    const uint8_t *payload = data + sizeof(message_header_t);
+    size_t payload_len = len - sizeof(message_header_t);
     
-    // Initialize the secret share part of the keypair
-    memcpy(keypair.secret, payload + sizeof(uint32_t), 32);
-    
-    LOG_INF("Received secret share for participant %d", receiver_index);
-    log_hex_bytes("Secret share", keypair.secret, 32);
-}
-
-// Process a public key message
-static void process_public_key(const uint8_t *payload, uint16_t len) {
-    if (len != sizeof(uint32_t) * 2 + 64 + 33) {
-        LOG_ERR("Invalid public key payload size: %d", len);
+    // Validate header
+    if (header->magic != MSG_HEADER_MAGIC) {
+        LOG_ERR("Invalid magic number: 0x%08x (expected 0x%08x)", 
+                header->magic, MSG_HEADER_MAGIC);
         return;
     }
     
-    // Extract public key data
-    uint32_t index, max_participants;
-    uint8_t *ptr = (uint8_t *)payload;
-    
-    memcpy(&index, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
-    
-    memcpy(&max_participants, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
-    
-    // Initialize the public key part of the keypair
-    keypair.public_keys.index = index;
-    keypair.public_keys.max_participants = max_participants;
-    memcpy(keypair.public_keys.public_key, ptr, 64);
-    ptr += 64;
-    memcpy(keypair.public_keys.group_public_key, ptr, 33);
-    
-    LOG_INF("Received public key for index %d (max participants: %d)",
-           index, max_participants);
-    log_hex_bytes("Public key", keypair.public_keys.public_key, 64);
-    log_hex_bytes("Group public key", keypair.public_keys.group_public_key, 33);
-}
-
-// Process a commitments message
-static void process_commitments(const uint8_t *payload, uint16_t len) {
-    if (len < sizeof(uint32_t) * 2 + 32 + 64) {
-        LOG_ERR("Invalid commitments payload size: %d", len);
+    if (header->version != MSG_VERSION) {
+        LOG_ERR("Unsupported version: %d", header->version);
         return;
     }
     
-    // Extract data from payload
-    uint32_t index, num_coefficients;
-    uint8_t *ptr = (uint8_t *)payload;
-    
-    memcpy(&index, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
-    
-    memcpy(&num_coefficients, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
-    
-    // Clean up any existing commitments
-    if (commitments != NULL) {
-        secp256k1_frost_vss_commitments_destroy(commitments);
-    }
-    
-    // Create new commitments structure
-    commitments = secp256k1_frost_vss_commitments_create(num_coefficients);
-    if (commitments == NULL) {
-        LOG_ERR("Failed to create commitments structure");
+    if (header->payload_len != payload_len) {
+        LOG_ERR("Payload length mismatch: expected %d, got %zu", 
+                header->payload_len, payload_len);
         return;
     }
     
-    // Fill in commitments data
-    commitments->index = index;
-    commitments->num_coefficients = num_coefficients;
+    LOG_INF("Received message: type=0x%02x, participant=%u, payload_len=%u",
+            header->msg_type, header->participant, header->payload_len);
     
-    memcpy(commitments->zkp_z, ptr, 32);
-    ptr += 32;
-    
-    memcpy(commitments->zkp_r, ptr, 64);
-    ptr += 64;
-    
-    // Copy coefficient commitments
-    size_t coef_data_size = num_coefficients * sizeof(secp256k1_frost_vss_commitment);
-    memcpy(commitments->coefficient_commitments, ptr, coef_data_size);
-    
-    LOG_INF("Received commitments (index: %d, num_coefficients: %d)", 
-           index, num_coefficients);
-}
-
-// Process end of transmission
-static void process_end_transmission(void) {
-    LOG_INF("End of transmission received");
-    LOG_INF("All FROST key material received successfully!");
-
-    // Write received data to flash
-    int rc = write_frost_data_to_flash();
-    if (rc == 0) {
-        // Read back and verify the data
-        read_frost_data_from_flash();
-    }
-}
-
-// Process a complete message
-static void process_message(const message_header_t *header, const uint8_t *payload) {
-    LOG_INF("Processing message type 0x%02x for participant %d (payload len: %d)", 
-           header->msg_type, header->participant, header->payload_len);
+    received_data.participant_id = header->participant;
     
     switch (header->msg_type) {
-        case MSG_TYPE_SECRET_SHARE:
-            process_secret_share(payload, header->payload_len);
+        case MSG_TYPE_SECRET_SHARE: {
+            if (payload_len != sizeof(serialized_share_t)) {
+                LOG_ERR("Invalid secret share size: %zu (expected %zu)", 
+                        payload_len, sizeof(serialized_share_t));
+                break;
+            }
+            
+            memcpy(&received_data.secret_share, payload, sizeof(serialized_share_t));
+            received_data.has_secret_share = true;
+            
+            LOG_INF("Secret share received:");
+            LOG_INF("  Receiver index: %u", received_data.secret_share.receiver_index);
+            print_hex("  Share value", received_data.secret_share.value, 32);
             break;
+        }
         
-        case MSG_TYPE_PUBLIC_KEY:
-            process_public_key(payload, header->payload_len);
+        case MSG_TYPE_PUBLIC_KEY: {
+            if (payload_len != sizeof(serialized_pubkey_t)) {
+                LOG_ERR("Invalid public key size: %zu (expected %zu)", 
+                        payload_len, sizeof(serialized_pubkey_t));
+                break;
+            }
+            
+            memcpy(&received_data.public_key, payload, sizeof(serialized_pubkey_t));
+            received_data.has_public_key = true;
+            
+            LOG_INF("Public key received:");
+            LOG_INF("  Index: %u", received_data.public_key.index);
+            LOG_INF("  Max participants: %u", received_data.public_key.max_participants);
+            print_hex("  Public key", received_data.public_key.public_key, 64);
+            print_hex("  Group public key", received_data.public_key.group_public_key, 33);
             break;
+        }
         
-        case MSG_TYPE_COMMITMENTS:
-            process_commitments(payload, header->payload_len);
+        case MSG_TYPE_COMMITMENTS: {
+            if (payload_len < sizeof(uint32_t) * 2 + 32 + 64) {
+                LOG_ERR("Invalid commitments size: %zu", payload_len);
+                break;
+            }
+            
+            const uint8_t *ptr = payload;
+            
+            // Parse index and num_coefficients
+            memcpy(&received_data.commitment_index, ptr, sizeof(uint32_t));
+            ptr += sizeof(uint32_t);
+            memcpy(&received_data.num_coefficients, ptr, sizeof(uint32_t));
+            ptr += sizeof(uint32_t);
+            
+            // Parse zkp_z and zkp_r
+            memcpy(received_data.zkp_z, ptr, 32);
+            ptr += 32;
+            memcpy(received_data.zkp_r, ptr, 64);
+            ptr += 64;
+            
+            // Parse coefficient commitments
+            size_t coef_size = payload_len - (sizeof(uint32_t) * 2 + 32 + 64);
+            if (received_data.coefficient_commitments) {
+                k_free(received_data.coefficient_commitments);
+            }
+            received_data.coefficient_commitments = k_malloc(coef_size);
+            if (received_data.coefficient_commitments) {
+                memcpy(received_data.coefficient_commitments, ptr, coef_size);
+                received_data.coefficient_commitments_size = coef_size;
+                received_data.has_commitments = true;
+                
+                LOG_INF("Commitments received:");
+                LOG_INF("  Index: %u", received_data.commitment_index);
+                LOG_INF("  Num coefficients: %u", received_data.num_coefficients);
+                print_hex("  ZKP z", received_data.zkp_z, 32);
+                print_hex("  ZKP r", received_data.zkp_r, 64);
+                LOG_INF("  Coefficient commitments size: %zu bytes", coef_size);
+            } else {
+                LOG_ERR("Failed to allocate memory for commitments");
+            }
             break;
+        }
         
-        case MSG_TYPE_END_TRANSMISSION:
-            process_end_transmission();
+        case MSG_TYPE_END_TRANSMISSION: {
+            LOG_INF("End transmission received");
+            received_data.transmission_complete = true;
+            
+            // Print summary of received data
+            LOG_INF("\n=== FROST Key Data Summary ===");
+            LOG_INF("Participant ID: %u", received_data.participant_id);
+            LOG_INF("Secret share: %s", received_data.has_secret_share ? "YES" : "NO");
+            LOG_INF("Public key: %s", received_data.has_public_key ? "YES" : "NO");
+            LOG_INF("Commitments: %s", received_data.has_commitments ? "YES" : "NO");
+            LOG_INF("Transmission complete: %s", received_data.transmission_complete ? "YES" : "NO");
+            
+            if (received_data.has_secret_share && received_data.has_public_key && 
+                received_data.has_commitments) {
+                LOG_INF(">>> All FROST key data received successfully! <<<");
+                
+                // Send acknowledgment by changing the status report
+                report_1.value = 0xFF; // Signal successful reception
+            } else {
+                LOG_WRN(">>> Incomplete FROST key data received <<<");
+                report_1.value = 0xEE; // Signal incomplete reception
+            }
             break;
+        }
         
         default:
             LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
@@ -339,118 +288,245 @@ static void process_message(const message_header_t *header, const uint8_t *paylo
     }
 }
 
-// UART ISR callback
-static void uart_cb(const struct device *dev, void *user_data) {
-    uint8_t byte;
+// Function to handle incoming data chunks
+static void handle_incoming_data(const uint8_t *data, size_t len) {
+    LOG_DBG("Received %zu bytes of raw data", len);
     
-    // Process all available bytes
-    while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
-        if (uart_irq_rx_ready(dev)) {
-            // Read available bytes into ring buffer
-            while (uart_fifo_read(dev, &byte, 1) == 1) {
-                ring_buf_put(&rx_ring_buf, &byte, 1);
+    if (len == 0) {
+        return;
+    }
+    
+    // Skip report ID if present (check if first byte is report ID)
+    const uint8_t *actual_data = data;
+    size_t actual_len = len;
+    
+    // If this looks like it starts with a report ID (0x02 for output reports), skip it
+    if (len > 0 && data[0] == 0x02) {
+        actual_data = data + 1;
+        actual_len = len - 1;
+        LOG_DBG("Skipped report ID, processing %zu bytes", actual_len);
+    }
+    
+    // Remove trailing zeros (common in HID reports)
+    while (actual_len > 0 && actual_data[actual_len - 1] == 0) {
+        actual_len--;
+    }
+    
+    if (actual_len == 0) {
+        LOG_DBG("No actual data after processing");
+        return;
+    }
+    
+    LOG_DBG("Processing %zu bytes of actual data", actual_len);
+    
+    // If we're not currently receiving a message, check if this is the start of one
+    if (!receiving_message) {
+        if (actual_len >= sizeof(message_header_t)) {
+            const message_header_t *header = (const message_header_t *)actual_data;
+            if (header->magic == MSG_HEADER_MAGIC) {
+                // This looks like the start of a new message
+                expected_message_size = sizeof(message_header_t) + header->payload_len;
+                receiving_message = true;
+                receive_buffer_pos = 0;
+                LOG_INF("Starting new message, expecting %zu bytes total", expected_message_size);
+                
+                // Validate expected size
+                if (expected_message_size > sizeof(receive_buffer)) {
+                    LOG_ERR("Message too large: %zu bytes (max %zu)", 
+                            expected_message_size, sizeof(receive_buffer));
+                    receiving_message = false;
+                    return;
+                }
+            } else {
+                LOG_DBG("Data doesn't look like message start (magic=0x%08x), ignoring", 
+                        header->magic);
+                return;
             }
+        } else {
+            LOG_DBG("Not enough data for header (%zu < %zu), ignoring", 
+                    actual_len, sizeof(message_header_t));
+            return;
+        }
+    }
+    
+    // Add data to buffer
+    size_t space_available = sizeof(receive_buffer) - receive_buffer_pos;
+    size_t bytes_to_copy = (actual_len > space_available) ? space_available : actual_len;
+    
+    if (bytes_to_copy > 0) {
+        memcpy(receive_buffer + receive_buffer_pos, actual_data, bytes_to_copy);
+        receive_buffer_pos += bytes_to_copy;
+        
+        LOG_DBG("Buffer now has %zu bytes (expecting %zu)", 
+                receive_buffer_pos, expected_message_size);
+        
+        // Check if we have a complete message
+        if (receive_buffer_pos >= expected_message_size) {
+            LOG_INF("Complete message received, processing...");
+            process_message(receive_buffer, expected_message_size);
+            
+            // Reset for next message
+            receiving_message = false;
+            receive_buffer_pos = 0;
+            expected_message_size = 0;
         }
     }
 }
 
-// Main application
-void main(void) {
-    uint8_t temp_buf[64];
-    size_t bytes_read;
-    
-    LOG_INF("FROST Key Receiver starting...");
-    
-    // Initialize communication buffers
-    ring_buf_init(&rx_ring_buf, sizeof(rx_buf), rx_buf);
-    
-    // Get UART device
-    uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
-    if (!device_is_ready(uart_dev)) {
-        LOG_ERR("UART device not ready");
-        return;
-    }
-    
-    // Configure UART
-    uart_irq_callback_set(uart_dev, uart_cb);
-    uart_irq_rx_enable(uart_dev);
-    
-    // Initialize secp256k1 context
-    ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    if (ctx == NULL) {
-        LOG_ERR("Failed to create secp256k1 context");
-        return;
-    }
-    
-    // Initialize keypair to zeros
-    memset(&keypair, 0, sizeof(keypair));
-    commitments = NULL;
-    
-    LOG_INF("Ready to receive FROST key material...");
-    
-    while (1) {
-        // Process ring buffer data
-        if (rx_state == WAITING_FOR_HEADER) {
-            // Try to read header
-            bytes_read = ring_buf_peek(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-            
-            if (bytes_read == sizeof(message_header_t)) {
-                // Copy header to our structure
-                memcpy(&current_header, temp_buf, sizeof(message_header_t));
-                
-                // Validate header
-                if (current_header.magic != MSG_HEADER_MAGIC) {
-                    LOG_ERR("Invalid magic number: 0x%08x", current_header.magic);
-                    // Discard one byte and try again
-                    ring_buf_get(&rx_ring_buf, temp_buf, 1);
-                    continue;
-                }
-                
-                if (current_header.version != MSG_VERSION) {
-                    LOG_ERR("Unsupported protocol version: %d", current_header.version);
-                    // Discard the header
-                    ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-                    continue;
-                }
-                
-                if (current_header.payload_len > MAX_MSG_SIZE) {
-                    LOG_ERR("Payload too large: %d", current_header.payload_len);
-                    // Discard the header
-                    ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-                    continue;
-                }
-                
-                // Header is valid, consume it from the ring buffer
-                ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-                
-                // If no payload, process immediately
-                if (current_header.payload_len == 0) {
-                    process_message(&current_header, NULL);
-                } else {
-                    // If payload, transition to waiting for payload
-                    rx_state = WAITING_FOR_PAYLOAD;
-                    payload_bytes_received = 0;
-                }
-            }
-        }
-        
-        if (rx_state == WAITING_FOR_PAYLOAD) {
-            // Try to read enough bytes to complete the payload
-            uint16_t remaining = current_header.payload_len - payload_bytes_received;
-            bytes_read = ring_buf_get(&rx_ring_buf, 
-                                     payload_buffer + payload_bytes_received, 
-                                     remaining);
-            
-            payload_bytes_received += bytes_read;
-            
-            // If payload is complete, process it
-            if (payload_bytes_received == current_header.payload_len) {
-                process_message(&current_header, payload_buffer);
-                rx_state = WAITING_FOR_HEADER;
-            }
-        }
-        
-        // Sleep a bit to avoid busy waiting
-        k_msleep(10);
-    }
+static void send_report(struct k_work *work)
+{
+	int ret, wrote;
+
+	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		ret = hid_int_ep_write(hdev, (uint8_t *)&report_1,
+				       sizeof(report_1), &wrote);
+		if (ret != 0) {
+			/*
+			 * Do nothing and wait until host has reset the device
+			 * and hid_ep_in_busy is cleared.
+			 */
+			LOG_ERR("Failed to submit report");
+		} else {
+			LOG_DBG("Status report submitted (value=0x%02x)", report_1.value);
+		}
+	} else {
+		LOG_DBG("HID IN endpoint busy");
+	}
+}
+
+static void int_in_ready_cb(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		LOG_WRN("IN endpoint callback without preceding buffer write");
+	}
+}
+
+// Output report callback - this is where we receive data from the host
+static void int_out_ready_cb(const struct device *dev)
+{
+	uint8_t buffer[65]; // 64 bytes + potential report ID
+	int ret, received;
+	
+	ret = hid_int_ep_read(dev, buffer, sizeof(buffer), &received);
+	if (ret == 0 && received > 0) {
+		LOG_DBG("HID OUT: Received %d bytes from host", received);
+		handle_incoming_data(buffer, received);
+	} else if (ret != 0) {
+		LOG_ERR("Failed to read from HID OUT endpoint: %d", ret);
+	}
+}
+
+// Set Output Report callback - alternative way to receive data
+static int set_report_cb(const struct device *dev, struct usb_setup_packet *setup,
+			 int32_t *len, uint8_t **data)
+{
+	LOG_DBG("Set report callback: type=%d, id=%d, len=%d", 
+	        setup->wValue >> 8, setup->wValue & 0xFF, *len);
+	
+	if (*len > 0 && *data) {
+		handle_incoming_data(*data, *len);
+	}
+	
+	return 0;
+}
+
+static void on_idle_cb(const struct device *dev, uint16_t report_id)
+{
+	LOG_DBG("On idle callback");
+	k_work_submit(&report_send);
+}
+
+static void report_event_handler(struct k_timer *dummy)
+{
+	/* Increment reported data for heartbeat */
+	if (report_1.value < 0xEE) {
+		report_1.value++;
+	} else if (!received_data.transmission_complete) {
+		report_1.value = 1; // Reset counter if not in final state
+	}
+	k_work_submit(&report_send);
+}
+
+static void protocol_cb(const struct device *dev, uint8_t protocol)
+{
+	LOG_INF("New protocol: %s", protocol == HID_PROTOCOL_BOOT ?
+		"boot" : "report");
+}
+
+static const struct hid_ops ops = {
+	.int_in_ready = int_in_ready_cb,
+	.int_out_ready = int_out_ready_cb,
+	.on_idle = on_idle_cb,
+	.protocol_change = protocol_cb,
+	.set_report = set_report_cb,
+};
+
+static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
+{
+	switch (status) {
+	case USB_DC_RESET:
+		configured = false;
+		LOG_INF("USB Reset");
+		break;
+	case USB_DC_CONFIGURED:
+		if (!configured) {
+			int_in_ready_cb(hdev);
+			configured = true;
+			LOG_INF("USB Configured - Ready to receive FROST data");
+		}
+		break;
+	case USB_DC_SOF:
+		break;
+	default:
+		LOG_DBG("USB status %u unhandled", status);
+		break;
+	}
+}
+
+int main(void)
+{
+	int ret;
+
+	LOG_INF("=== FROST Key Receiver Starting ===");
+
+	hdev = device_get_binding("HID_0");
+	if (hdev == NULL) {
+		LOG_ERR("Cannot get USB HID Device");
+		return -ENODEV;
+	}
+
+	LOG_INF("HID Device: dev %p", hdev);
+	LOG_INF("Ready to receive FROST cryptographic key data via USB HID");
+
+	usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc),
+				&ops);
+
+	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
+
+	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
+		LOG_WRN("Failed to set Protocol Code");
+	}
+
+	ret = usb_hid_init(hdev);
+	if (ret != 0) {
+		LOG_ERR("Failed to initialize HID: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("Starting FROST key receiver application");
+
+	ret = usb_enable(status_cb);
+	if (ret != 0) {
+		LOG_ERR("Failed to enable USB: %d", ret);
+		return ret;
+	}
+
+	k_work_init(&report_send, send_report);
+
+	LOG_INF("=== FROST Key Receiver Ready ===");
+	LOG_INF("Connect to host and start key distribution...");
+
+	return 0;
 }
