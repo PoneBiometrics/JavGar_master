@@ -178,10 +178,8 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
 
     printf("Looking for HID device with VID:0x%04X PID:0x%04X\n", vendor_id, product_id);
 
-    // Get HID GUID
     HidD_GetHidGuid(&hid_guid);
 
-    // Get device information set
     device_info_set = SetupDiGetClassDevs(&hid_guid, NULL, NULL, 
                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (device_info_set == INVALID_HANDLE_VALUE) {
@@ -191,31 +189,48 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
 
     device_interface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
-    // Enumerate devices
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(device_info_set, NULL, &hid_guid, 
                                                   i, &device_interface_data); i++) {
-        // Get required buffer size
         SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data, 
                                        NULL, 0, &required_size, NULL);
 
-        // Allocate buffer
         device_interface_detail_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(required_size);
         if (!device_interface_detail_data) continue;
         device_interface_detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
 
-        // Get device path
         if (SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data,
                                            device_interface_detail_data, required_size,
                                            NULL, NULL)) {
-            // Try to open device - IMPORTANT: Use correct access flags
-            HANDLE temp_handle = CreateFile(device_interface_detail_data->DevicePath,
-                                          GENERIC_WRITE,  // Only WRITE for output reports
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                          NULL, OPEN_EXISTING, 
-                                          FILE_FLAG_OVERLAPPED,  // Use overlapped I/O
-                                          NULL);
+            
+            // Try different access modes
+            DWORD access_modes[] = {
+                GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_WRITE | FILE_SHARE_READ | FILE_SHARE_WRITE
+            };
+            
+            HANDLE temp_handle = INVALID_HANDLE_VALUE;
+            
+            for (int mode_idx = 0; mode_idx < 3 && temp_handle == INVALID_HANDLE_VALUE; mode_idx++) {
+                temp_handle = CreateFile(device_interface_detail_data->DevicePath,
+                                       access_modes[mode_idx],
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       NULL, OPEN_EXISTING, 
+                                       0,  // Try without FILE_FLAG_OVERLAPPED first
+                                       NULL);
+                
+                if (temp_handle == INVALID_HANDLE_VALUE) {
+                    // Try with overlapped I/O
+                    temp_handle = CreateFile(device_interface_detail_data->DevicePath,
+                                           access_modes[mode_idx],
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                           NULL, OPEN_EXISTING, 
+                                           FILE_FLAG_OVERLAPPED,
+                                           NULL);
+                }
+            }
+            
             if (temp_handle != INVALID_HANDLE_VALUE) {
-                // Get device attributes
                 HIDD_ATTRIBUTES attributes;
                 attributes.Size = sizeof(HIDD_ATTRIBUTES);
                 if (HidD_GetAttributes(temp_handle, &attributes)) {
@@ -225,7 +240,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                     if (attributes.VendorID == vendor_id && attributes.ProductID == product_id) {
                         printf("Found matching device!\n");
                         
-                        // Get preparsed data and capabilities
                         PHIDP_PREPARSED_DATA preparsed_data;
                         if (HidD_GetPreparsedData(temp_handle, &preparsed_data)) {
                             HIDP_CAPS capabilities;
@@ -235,7 +249,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                                 printf("  Usage: 0x%04X\n", capabilities.Usage);
                                 printf("  Output Report Length: %d\n", capabilities.OutputReportByteLength);
                                 
-                                // Set up communication handle
                                 comm.type = COMM_TYPE_USB_HID;
                                 comm.hid_handle = temp_handle;
                                 comm.preparsed_data = preparsed_data;
@@ -279,33 +292,61 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
             return FALSE;
         }
         
-        // Set report ID (0x02 for output reports as defined in receiver)
+        // Set report ID
         report[0] = 0x02;
         
-        // Calculate how much data we can fit in this report
-        size_t available_space = comm->output_report_length - 1; // -1 for report ID
-        size_t chunk_size = (available_space < (len - bytes_sent)) ? 
-                            available_space : (len - bytes_sent);
+        // Calculate chunk size - leave room for report ID
+        size_t available_space = comm->output_report_length - 1;
+        size_t remaining = len - bytes_sent;
+        size_t chunk_size = (available_space < remaining) ? available_space : remaining;
         
-        // Copy data to report buffer (starting at byte 1, after report ID)
+        // Copy data to report buffer
         memcpy(report + 1, data_ptr + bytes_sent, chunk_size);
         
-        printf("Sending chunk %zu bytes (total sent: %zu/%zu)\n", 
-               chunk_size, bytes_sent, len);
+        printf("Sending chunk %zu bytes (sent: %zu/%zu)\n", chunk_size, bytes_sent, len);
         
-        // Send using HidD_SetOutputReport - this is the correct method for output reports
+        // Send the report
         if (!HidD_SetOutputReport(comm->hid_handle, report, comm->output_report_length)) {
             DWORD error = GetLastError();
-            printf("Failed to send HID output report. Error: %lu\n", error);
-            free(report);
-            return FALSE;
+            printf("Failed to send HID report. Error: %lu\n", error);
+            
+            // Try alternative method if first fails
+            DWORD bytes_written;
+            OVERLAPPED overlapped = {0};
+            overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            
+            if (overlapped.hEvent) {
+                BOOL write_result = WriteFile(comm->hid_handle, report, comm->output_report_length, 
+                                            &bytes_written, &overlapped);
+                if (!write_result) {
+                    if (GetLastError() == ERROR_IO_PENDING) {
+                        // Wait for completion
+                        if (WaitForSingleObject(overlapped.hEvent, 5000) == WAIT_OBJECT_0) {
+                            if (GetOverlappedResult(comm->hid_handle, &overlapped, &bytes_written, FALSE)) {
+                                printf("Alternative send method succeeded\n");
+                                write_result = TRUE;
+                            }
+                        }
+                    }
+                }
+                CloseHandle(overlapped.hEvent);
+                
+                if (!write_result) {
+                    printf("Both send methods failed\n");
+                    free(report);
+                    return FALSE;
+                }
+            } else {
+                free(report);
+                return FALSE;
+            }
         }
         
         free(report);
         bytes_sent += chunk_size;
         
-        // Small delay between chunks
-        Sleep(50);
+        // Delay between chunks to prevent overwhelming the receiver
+        Sleep(100);
     }
     
     printf("Successfully sent all %zu bytes\n", bytes_sent);
@@ -332,7 +373,6 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
                   const void* payload, uint16_t payload_len) {
     message_header_t header;
     
-    // Fill header
     header.magic = MSG_HEADER_MAGIC;
     header.version = MSG_VERSION;
     header.msg_type = msg_type;
@@ -342,8 +382,17 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
     printf("Sending message: type=0x%02X, participant=%u, payload_len=%u\n",
            msg_type, participant, payload_len);
     
-    // Always send header and payload together to avoid fragmentation issues
     size_t total_size = sizeof(header) + payload_len;
+    
+    // Check if message fits in HID report
+    if (comm->type == COMM_TYPE_USB_HID) {
+        size_t max_data_per_report = comm->output_report_length - 1; // -1 for report ID
+        if (total_size > max_data_per_report) {
+            printf("Message size %zu exceeds single report capacity %zu, will be chunked\n", 
+                   total_size, max_data_per_report);
+        }
+    }
+    
     uint8_t* combined_buffer = (uint8_t*)malloc(total_size);
     if (!combined_buffer) {
         printf("Failed to allocate combined buffer\n");
@@ -360,7 +409,12 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
     
     if (result) {
         printf("Message sent successfully\n");
+        // Add delay after each message
+        Sleep(1000);
+    } else {
+        printf("Failed to send message\n");
     }
+    
     return result;
 }
 
