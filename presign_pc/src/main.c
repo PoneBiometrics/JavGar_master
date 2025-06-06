@@ -285,7 +285,7 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
     printf("Sending %zu bytes via HID (Report Length: %d)\n", len, comm->output_report_length);
     
     while (bytes_sent < len) {
-        // Allocate report buffer
+        // Allocate full report buffer (required by many HID devices)
         uint8_t* report = (uint8_t*)calloc(1, comm->output_report_length);
         if (!report) {
             printf("Failed to allocate report buffer\n");
@@ -295,17 +295,21 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
         // Set report ID
         report[0] = 0x02;
         
-        // Calculate chunk size - leave room for report ID
-        size_t available_space = comm->output_report_length - 1;
+        // Calculate chunk size - leave room for report ID and length byte
+        size_t available_space = comm->output_report_length - 2; // -1 for report ID, -1 for length
         size_t remaining = len - bytes_sent;
         size_t chunk_size = (available_space < remaining) ? available_space : remaining;
         
-        // Copy data to report buffer
-        memcpy(report + 1, data_ptr + bytes_sent, chunk_size);
+        // Set the actual data length in the second byte
+        report[1] = (uint8_t)chunk_size;
         
-        printf("Sending chunk %zu bytes (sent: %zu/%zu)\n", chunk_size, bytes_sent, len);
+        // Copy data to report buffer starting at byte 2
+        memcpy(report + 2, data_ptr + bytes_sent, chunk_size);
         
-        // Send the report
+        printf("Sending chunk %zu bytes (sent: %zu/%zu), full report: %d bytes\n", 
+               chunk_size, bytes_sent, len, comm->output_report_length);
+        
+        // Send the full report
         if (!HidD_SetOutputReport(comm->hid_handle, report, comm->output_report_length)) {
             DWORD error = GetLastError();
             printf("Failed to send HID report. Error: %lu\n", error);

@@ -1,6 +1,8 @@
 /*
- * FROST Key Receiver - Fixed Zephyr USB HID Implementation
+ * FROST Key Receiver - Chunked Data Protocol with Flash Storage
  * Receives FROST cryptographic key data via USB HID from Windows host
+ * Now handles chunked transmission with length bytes
+ * Stores received data to flash memory for persistence
  */
 
 #include <zephyr/kernel.h>
@@ -8,6 +10,8 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/storage/flash_map.h>
 #include <string.h>
 
 #define LOG_LEVEL LOG_LEVEL_INF
@@ -22,6 +26,9 @@ static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 #define REPORT_ID_INPUT		0x01  // Input reports (device to host)
 #define REPORT_ID_OUTPUT	0x02  // Output reports (host to device)
 #define REPORT_PERIOD		K_SECONDS(2)
+
+// Flash storage partition
+#define STORAGE_PARTITION     storage_partition
 
 // Message protocol constants - MUST match sender
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
@@ -57,6 +64,25 @@ struct __attribute__((packed)) serialized_pubkey {
     uint8_t group_public_key[33];
 };
 
+// Flash storage structure - matches the UART version
+typedef struct {
+    // Keypair storage
+    uint32_t keypair_index;
+    uint32_t keypair_max_participants;
+    uint8_t keypair_secret[32];
+    uint8_t keypair_public_key[64];
+    uint8_t keypair_group_public_key[33];
+
+    // Commitments storage
+    uint32_t commitments_index;
+    uint32_t commitments_num_coefficients;
+    uint8_t commitments_zkp_z[32];
+    uint8_t commitments_zkp_r[64];
+    // Coefficient commitments data
+    uint8_t commitments_coefficient_data[512];  // Increased size
+    size_t commitments_coefficient_data_size;
+} __packed frost_flash_storage_t;
+
 // Storage for received data - using static allocation
 static struct received_frost_data {
     bool has_secret_share;
@@ -67,23 +93,23 @@ static struct received_frost_data {
     struct serialized_share secret_share;
     struct serialized_pubkey public_key;
     
-    // Commitments data (fixed size)
+    // Commitments data (increased size)
     uint32_t commitment_index;
     uint32_t num_coefficients;
     uint8_t zkp_z[32];
     uint8_t zkp_r[64];
-    uint8_t coefficient_commitments[256];  // Reduced size
+    uint8_t coefficient_commitments[512];  // Increased size
     size_t coefficient_commitments_size;
     
     uint32_t participant_id;
 } received_data;
 
-// Buffer for assembling incoming data - reduced size and moved to static
-#define RECEIVE_BUFFER_SIZE 512  // Reduced from 1024
-static uint8_t receive_buffer[RECEIVE_BUFFER_SIZE];
-static size_t receive_buffer_pos = 0;
-static size_t expected_message_size = 0;
-static bool receiving_message = false;
+// NEW: Chunked data reassembly buffer - larger for complete messages
+#define REASSEMBLY_BUFFER_SIZE 2048
+static uint8_t reassembly_buffer[REASSEMBLY_BUFFER_SIZE];
+static size_t reassembly_pos = 0;
+static size_t expected_total_size = 0;
+static bool reassembling_message = false;
 
 // Mutex to protect buffer access
 K_MUTEX_DEFINE(buffer_mutex);
@@ -99,8 +125,12 @@ static struct report {
 static void report_event_handler(struct k_timer *dummy);
 K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
 
+// Timeout handling for stuck receive states
+static void receive_timeout_handler(struct k_timer *timer);
+K_TIMER_DEFINE(receive_timeout_timer, receive_timeout_handler, NULL);
+
 /*
- * Fixed HID Report Descriptor
+ * Fixed HID Report Descriptor - Updated for chunked protocol
  */
 static const uint8_t hid_report_desc[] = {
 	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
@@ -116,7 +146,7 @@ static const uint8_t hid_report_desc[] = {
 	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
 	HID_INPUT(0x02),
 	
-	// Output report (host to device)
+	// Output report (host to device) - Updated for chunked data
 	HID_REPORT_ID(REPORT_ID_OUTPUT),
 	HID_LOGICAL_MIN8(0x00),
 	HID_LOGICAL_MAX16(0xFF, 0x00),
@@ -128,7 +158,7 @@ static const uint8_t hid_report_desc[] = {
 	HID_END_COLLECTION,
 };
 
-// Helper function to safely print hex data - simplified to avoid stack issues
+// Helper function to safely print hex data
 static void print_hex_safe(const char *label, const uint8_t *data, size_t len)
 {
     if (!data || len == 0) {
@@ -136,7 +166,6 @@ static void print_hex_safe(const char *label, const uint8_t *data, size_t len)
         return;
     }
     
-    // Very limited output to avoid any buffer issues
     size_t max_len = (len > 16) ? 16 : len;
     LOG_INF("%s (%zu bytes): %02x%02x%02x%02x...", 
             label, len, 
@@ -146,11 +175,156 @@ static void print_hex_safe(const char *label, const uint8_t *data, size_t len)
             max_len > 3 ? data[3] : 0);
 }
 
-// Function to safely process a complete message - simplified
+// Function to reset reassembly state
+static void reset_reassembly_state(void)
+{
+    reassembling_message = false;
+    reassembly_pos = 0;
+    expected_total_size = 0;
+    k_timer_stop(&receive_timeout_timer);
+    LOG_INF("Reassembly state reset");
+}
+
+// Function to write FROST key material to flash
+static int write_frost_data_to_flash(void) {
+    const struct flash_area *fa;
+    int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
+    if (rc < 0) {
+        LOG_ERR("Failed to open flash area (%d)", rc);
+        return rc;
+    }
+
+    // Prepare serializable storage structure
+    frost_flash_storage_t flash_data = {0};
+
+    // Fill keypair data from received_data
+    if (received_data.has_secret_share) {
+        flash_data.keypair_index = received_data.secret_share.receiver_index;
+        memcpy(flash_data.keypair_secret, received_data.secret_share.value, 32);
+    }
+    
+    if (received_data.has_public_key) {
+        flash_data.keypair_index = received_data.public_key.index;
+        flash_data.keypair_max_participants = received_data.public_key.max_participants;
+        memcpy(flash_data.keypair_public_key, received_data.public_key.public_key, 64);
+        memcpy(flash_data.keypair_group_public_key, received_data.public_key.group_public_key, 33);
+    }
+
+    // Fill commitments data
+    if (received_data.has_commitments) {
+        flash_data.commitments_index = received_data.commitment_index;
+        flash_data.commitments_num_coefficients = received_data.num_coefficients;
+        memcpy(flash_data.commitments_zkp_z, received_data.zkp_z, 32);
+        memcpy(flash_data.commitments_zkp_r, received_data.zkp_r, 64);
+        memcpy(flash_data.commitments_coefficient_data, received_data.coefficient_commitments, 
+               received_data.coefficient_commitments_size);
+        flash_data.commitments_coefficient_data_size = received_data.coefficient_commitments_size;
+    }
+
+    // Get flash device details
+    const struct device *flash_dev = flash_area_get_device(fa);
+    if (!device_is_ready(flash_dev)) {
+        LOG_ERR("Flash device not ready");
+        flash_area_close(fa);
+        return -1;
+    }
+
+    // Get erase block size
+    struct flash_pages_info info;
+    rc = flash_get_page_info_by_offs(flash_dev, fa->fa_off, &info);
+    if (rc != 0) {
+        LOG_ERR("Failed to get flash page info (%d)", rc);
+        flash_area_close(fa);
+        return rc;
+    }
+
+    // Erase flash sector
+    size_t erase_size = ROUND_UP(sizeof(frost_flash_storage_t), info.size);
+    rc = flash_area_erase(fa, 0, erase_size);
+    if (rc != 0) {
+        LOG_ERR("Failed to erase flash (%d)", rc);
+        flash_area_close(fa);
+        return rc;
+    }
+
+    // Prepare padded write buffer
+    size_t write_block_size = flash_get_write_block_size(flash_dev);
+    size_t padded_size = ROUND_UP(sizeof(frost_flash_storage_t), write_block_size);
+    uint8_t padded_buf[padded_size];
+    memset(padded_buf, 0xFF, padded_size);
+    memcpy(padded_buf, &flash_data, sizeof(frost_flash_storage_t));
+
+    // Write to flash
+    rc = flash_area_write(fa, 0, padded_buf, padded_size);
+    if (rc != 0) {
+        LOG_ERR("Failed to write to flash (%d)", rc);
+        flash_area_close(fa);
+        return rc;
+    }
+
+    LOG_INF("FROST key material written to flash.");
+    flash_area_close(fa);
+    return 0;
+}
+
+// Function to read and log FROST key material from flash
+static int read_frost_data_from_flash(void) {
+    const struct flash_area *fa;
+    int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
+    if (rc < 0) {
+        LOG_ERR("Failed to open flash area (%d)", rc);
+        return rc;
+    }
+
+    // Read back stored data
+    frost_flash_storage_t flash_data;
+    rc = flash_area_read(fa, 0, &flash_data, sizeof(frost_flash_storage_t));
+    if (rc != 0) {
+        LOG_ERR("Failed to read flash: %d", rc);
+        flash_area_close(fa);
+        return rc;
+    }
+
+    // Log keypair information
+    LOG_INF("=== Stored Keypair ===");
+    LOG_INF("Participant Index: %d", flash_data.keypair_index);
+    LOG_INF("Max Participants: %d", flash_data.keypair_max_participants);
+    
+    // Log secret and public keys in hex
+    char hex_buf[129];
+    for (int i = 0; i < 32; i++) {
+        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_secret[i]);
+    }
+    hex_buf[64] = '\0';
+    LOG_INF("Secret Share: %s", hex_buf);
+
+    for (int i = 0; i < 64; i++) {
+        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_public_key[i]);
+    }
+    hex_buf[128] = '\0';
+    LOG_INF("Public Key: %s", hex_buf);
+
+    for (int i = 0; i < 33; i++) {
+        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_group_public_key[i]);
+    }
+    hex_buf[66] = '\0';
+    LOG_INF("Group Public Key: %s", hex_buf);
+
+    // Log commitments info
+    LOG_INF("=== Stored Commitments ===");
+    LOG_INF("Commitments Index: %d", flash_data.commitments_index);
+    LOG_INF("Num Coefficients: %d", flash_data.commitments_num_coefficients);
+    LOG_INF("Coefficient Data Size: %zu", flash_data.commitments_coefficient_data_size);
+
+    flash_area_close(fa);
+    return 0;
+}
+
+// Function to safely process a complete message
 static void process_message(const uint8_t *data, size_t len)
 {
     if (!data || len < sizeof(struct message_header)) {
-        LOG_ERR("Invalid message size");
+        LOG_ERR("Invalid message size: %zu", len);
         return;
     }
     
@@ -158,7 +332,7 @@ static void process_message(const uint8_t *data, size_t len)
     
     // Validate header
     if (header->magic != MSG_HEADER_MAGIC || header->version != MSG_VERSION) {
-        LOG_ERR("Invalid header");
+        LOG_ERR("Invalid header: magic=0x%08x, version=0x%02x", header->magic, header->version);
         return;
     }
     
@@ -173,7 +347,6 @@ static void process_message(const uint8_t *data, size_t len)
     switch (header->msg_type) {
         case MSG_TYPE_SECRET_SHARE:
             if (payload_len >= sizeof(struct serialized_share)) {
-                // Use direct assignment to avoid memcpy issues
                 const struct serialized_share *share = (const struct serialized_share *)payload;
                 received_data.secret_share.receiver_index = share->receiver_index;
                 for (int i = 0; i < 32; i++) {
@@ -182,6 +355,8 @@ static void process_message(const uint8_t *data, size_t len)
                 received_data.has_secret_share = true;
                 LOG_INF("Secret share received (index=%u)", share->receiver_index);
                 print_hex_safe("Share", share->value, 32);
+            } else {
+                LOG_ERR("Secret share payload too small: %zu", payload_len);
             }
             break;
             
@@ -197,12 +372,15 @@ static void process_message(const uint8_t *data, size_t len)
                     received_data.public_key.group_public_key[i] = pubkey->group_public_key[i];
                 }
                 received_data.has_public_key = true;
-                LOG_INF("Public key received (index=%u)", pubkey->index);
+                LOG_INF("Public key received (index=%u, max_participants=%u)", 
+                        pubkey->index, pubkey->max_participants);
+            } else {
+                LOG_ERR("Public key payload too small: %zu", payload_len);
             }
             break;
             
         case MSG_TYPE_COMMITMENTS:
-            if (payload_len >= 8 + 32 + 64) {  // Minimum size check
+            if (payload_len >= 8 + 32 + 64) {
                 const uint8_t *ptr = payload;
                 received_data.commitment_index = *(uint32_t*)ptr;
                 ptr += 4;
@@ -219,7 +397,7 @@ static void process_message(const uint8_t *data, size_t len)
                 }
                 ptr += 64;
                 
-                // Copy remaining coefficient data safely
+                // Copy remaining coefficient data safely with bounds checking
                 size_t coef_size = payload_len - (8 + 32 + 64);
                 if (coef_size <= sizeof(received_data.coefficient_commitments)) {
                     for (size_t i = 0; i < coef_size; i++) {
@@ -227,8 +405,14 @@ static void process_message(const uint8_t *data, size_t len)
                     }
                     received_data.coefficient_commitments_size = coef_size;
                     received_data.has_commitments = true;
-                    LOG_INF("Commitments received (index=%u)", received_data.commitment_index);
+                    LOG_INF("Commitments received (index=%u, coefficients=%u, coef_size=%zu)", 
+                            received_data.commitment_index, received_data.num_coefficients, coef_size);
+                } else {
+                    LOG_ERR("Coefficient data too large: %zu > %zu", coef_size, 
+                            sizeof(received_data.coefficient_commitments));
                 }
+            } else {
+                LOG_ERR("Commitments payload too small: %zu", payload_len);
             }
             break;
             
@@ -245,7 +429,18 @@ static void process_message(const uint8_t *data, size_t len)
             if (received_data.has_secret_share && received_data.has_public_key && 
                 received_data.has_commitments) {
                 LOG_INF("SUCCESS: All data received!");
-                report_1.value = 0xFF;
+                
+                // Write received data to flash
+                int rc = write_frost_data_to_flash();
+                if (rc == 0) {
+                    LOG_INF("Data successfully stored to flash");
+                    // Read back and verify the data
+                    read_frost_data_from_flash();
+                    report_1.value = 0xFF;  // Success indicator
+                } else {
+                    LOG_ERR("Failed to store data to flash");
+                    report_1.value = 0xEE;  // Error indicator
+                }
             } else {
                 LOG_WRN("INCOMPLETE data received");
                 report_1.value = 0xEE;
@@ -258,76 +453,117 @@ static void process_message(const uint8_t *data, size_t len)
     }
 }
 
-// Simplified data handling to avoid stack/memory issues
-static void handle_incoming_data(const uint8_t *data, size_t len)
+// Timeout handler to reset stuck receive state
+static void receive_timeout_handler(struct k_timer *timer)
 {
-    if (!data || len == 0) return;
+    if (k_mutex_lock(&buffer_mutex, K_MSEC(10)) == 0) {
+        if (reassembling_message) {
+            LOG_WRN("Reassembly timeout - resetting state (had %zu/%zu bytes)", 
+                    reassembly_pos, expected_total_size);
+            reset_reassembly_state();
+        }
+        k_mutex_unlock(&buffer_mutex);
+    }
+}
+
+// NEW: Enhanced chunked data handler
+static void handle_chunked_data(const uint8_t *data, size_t len)
+{
+    if (!data || len < 3) {  // Report ID + Length + at least 1 byte data
+        LOG_WRN("Invalid chunk: too small (%zu bytes)", len);
+        return;
+    }
     
     if (k_mutex_lock(&buffer_mutex, K_MSEC(100)) != 0) {
         LOG_ERR("Mutex lock failed");
         return;
     }
     
-    // Skip report ID if present
-    const uint8_t *actual_data = data;
-    size_t actual_len = len;
+    // Extract chunk info: [Report ID][Length][Data...]
+    uint8_t report_id = data[0];
+    uint8_t chunk_len = data[1];
+    const uint8_t *chunk_data = data + 2;
     
-    if (len > 0 && data[0] == REPORT_ID_OUTPUT) {
-        actual_data = data + 1;
-        actual_len = len - 1;
-    }
-    
-    // Remove trailing zeros
-    while (actual_len > 0 && actual_data[actual_len - 1] == 0) {
-        actual_len--;
-    }
-    
-    if (actual_len == 0) {
+    // Validate chunk
+    if (report_id != REPORT_ID_OUTPUT) {
+        LOG_WRN("Wrong report ID: 0x%02x", report_id);
         k_mutex_unlock(&buffer_mutex);
         return;
     }
     
-    // Check for new message start
-    if (!receiving_message && actual_len >= sizeof(struct message_header)) {
-        const struct message_header *header = (const struct message_header *)actual_data;
+    if (chunk_len == 0 || chunk_len > (len - 2)) {
+        LOG_WRN("Invalid chunk length: %u (packet size: %zu)", chunk_len, len);
+        k_mutex_unlock(&buffer_mutex);
+        return;
+    }
+    
+    LOG_INF("CHUNK: %u bytes, reassembly=%d, pos=%zu/%zu", 
+            chunk_len, reassembling_message, reassembly_pos, expected_total_size);
+    
+    // Check if this is the start of a new message
+    if (!reassembling_message && chunk_len >= sizeof(struct message_header)) {
+        const struct message_header *header = (const struct message_header *)chunk_data;
         if (header->magic == MSG_HEADER_MAGIC) {
-            expected_message_size = sizeof(struct message_header) + header->payload_len;
+            // This is a new message start
+            expected_total_size = sizeof(struct message_header) + header->payload_len;
             
-            if (expected_message_size <= RECEIVE_BUFFER_SIZE) {
-                receiving_message = true;
-                receive_buffer_pos = 0;
-                LOG_INF("New message: %zu bytes expected", expected_message_size);
+            if (expected_total_size <= REASSEMBLY_BUFFER_SIZE) {
+                reassembling_message = true;
+                reassembly_pos = 0;
+                LOG_INF("NEW MESSAGE START: type=0x%02x, total=%zu bytes expected", 
+                        header->msg_type, expected_total_size);
+                
+                // Start timeout timer
+                k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
             } else {
-                LOG_ERR("Message too large: %zu", expected_message_size);
+                LOG_ERR("Message too large: %zu > %d", expected_total_size, REASSEMBLY_BUFFER_SIZE);
                 k_mutex_unlock(&buffer_mutex);
                 return;
             }
+        } else {
+            LOG_WRN("Not a message start (magic=0x%08x)", header->magic);
+            k_mutex_unlock(&buffer_mutex);
+            return;
         }
     }
     
-    // Add data to buffer
-    if (receiving_message && receive_buffer_pos < RECEIVE_BUFFER_SIZE) {
-        size_t space = RECEIVE_BUFFER_SIZE - receive_buffer_pos;
-        size_t to_copy = (actual_len > space) ? space : actual_len;
+    // Add chunk to reassembly buffer if we're reassembling
+    if (reassembling_message) {
+        size_t space_available = REASSEMBLY_BUFFER_SIZE - reassembly_pos;
+        size_t bytes_to_copy = (chunk_len > space_available) ? space_available : chunk_len;
         
-        // Copy byte by byte to avoid any alignment issues
-        for (size_t i = 0; i < to_copy; i++) {
-            receive_buffer[receive_buffer_pos + i] = actual_data[i];
-        }
-        receive_buffer_pos += to_copy;
-        
-        LOG_DBG("Buffer: %zu/%zu", receive_buffer_pos, expected_message_size);
-        
-        // Check if complete
-        if (receive_buffer_pos >= expected_message_size) {
-            LOG_INF("Message complete, processing");
-            process_message(receive_buffer, expected_message_size);
+        if (bytes_to_copy > 0) {
+            memcpy(reassembly_buffer + reassembly_pos, chunk_data, bytes_to_copy);
+            reassembly_pos += bytes_to_copy;
             
-            // Reset
-            receiving_message = false;
-            receive_buffer_pos = 0;
-            expected_message_size = 0;
+            LOG_INF("REASSEMBLY: %zu/%zu bytes (+%zu)", 
+                    reassembly_pos, expected_total_size, bytes_to_copy);
+            
+            // Check if message is complete
+            if (reassembly_pos >= expected_total_size) {
+                LOG_INF("MESSAGE COMPLETE: Processing %zu bytes", expected_total_size);
+                
+                // Stop timeout timer
+                k_timer_stop(&receive_timeout_timer);
+                
+                // Process the complete message
+                process_message(reassembly_buffer, expected_total_size);
+                
+                // Reset for next message
+                reset_reassembly_state();
+                
+                // If we received more data than expected, handle overflow
+                if (reassembly_pos > expected_total_size) {
+                    size_t overflow = reassembly_pos - expected_total_size;
+                    LOG_WRN("Data overflow: %zu bytes", overflow);
+                }
+            }
+        } else {
+            LOG_ERR("No space in reassembly buffer");
+            reset_reassembly_state();
         }
+    } else {
+        LOG_WRN("Received chunk but not reassembling - discarded %u bytes", chunk_len);
     }
     
     k_mutex_unlock(&buffer_mutex);
@@ -358,7 +594,13 @@ static void int_out_ready_cb(const struct device *dev)
 	
 	ret = hid_int_ep_read(dev, buffer, sizeof(buffer), &received);
 	if (ret == 0 && received > 0) {
-		handle_incoming_data(buffer, received);
+		// Reset/update timeout on successful data reception
+		k_timer_stop(&receive_timeout_timer);
+		if (reassembling_message) {
+			k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
+		}
+		
+		handle_chunked_data(buffer, received);
 	}
 }
 
@@ -366,7 +608,13 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
 			 int32_t *len, uint8_t **data)
 {
 	if (*len > 0 && *data) {
-		handle_incoming_data(*data, *len);
+		// Reset/update timeout on successful data reception
+		k_timer_stop(&receive_timeout_timer);
+		if (reassembling_message) {
+			k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
+		}
+		
+		handle_chunked_data(*data, *len);
 	}
 	return 0;
 }
@@ -407,12 +655,17 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
 	case USB_DC_RESET:
 		configured = false;
 		LOG_INF("USB Reset");
+		// Reset reassembly state on USB reset
+		if (k_mutex_lock(&buffer_mutex, K_MSEC(100)) == 0) {
+			reset_reassembly_state();
+			k_mutex_unlock(&buffer_mutex);
+		}
 		break;
 	case USB_DC_CONFIGURED:
 		if (!configured) {
 			int_in_ready_cb(hdev);
 			configured = true;
-			LOG_INF("USB Configured - Ready for FROST data");
+			LOG_INF("USB Configured - Ready for chunked FROST data");
 		}
 		break;
 	case USB_DC_SOF:
@@ -426,7 +679,7 @@ int main(void)
 {
 	int ret;
 
-	LOG_INF("=== FROST Key Receiver Starting ===");
+	LOG_INF("=== FROST Key Receiver with Chunked Protocol Starting ===");
 	
 	// Initialize data structure
 	memset(&received_data, 0, sizeof(received_data));
@@ -456,6 +709,7 @@ int main(void)
 
 	k_work_init(&report_send, send_report);
 
-	LOG_INF("=== FROST Receiver Ready ===");
+	LOG_INF("=== FROST Receiver with Chunked Protocol Ready ===");
+	LOG_INF("Reassembly buffer size: %d bytes", REASSEMBLY_BUFFER_SIZE);
 	return 0;
 }
