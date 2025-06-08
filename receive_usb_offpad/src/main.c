@@ -17,10 +17,17 @@
 #define LOG_LEVEL LOG_LEVEL_INF
 LOG_MODULE_REGISTER(frost_receiver);
 
+// Forward declarations for flash functions
+static int write_frost_data_to_flash(void);
+static int read_frost_data_from_flash(void);
+
 static bool configured;
 static const struct device *hdev;
 static struct k_work report_send;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
+
+// Work queue for flash operations
+static struct k_work flash_work;
 
 #define HID_EP_BUSY_FLAG	0
 #define REPORT_ID_INPUT		0x01  // Input reports (device to host)
@@ -89,6 +96,7 @@ static struct received_frost_data {
     bool has_public_key;
     bool has_commitments;
     bool transmission_complete;
+    bool flash_write_pending;
     
     struct serialized_share secret_share;
     struct serialized_pubkey public_key;
@@ -195,7 +203,8 @@ static int write_frost_data_to_flash(void) {
     }
 
     // Prepare serializable storage structure
-    frost_flash_storage_t flash_data = {0};
+    frost_flash_storage_t flash_data;
+    memset(&flash_data, 0, sizeof(frost_flash_storage_t));  // Clear all fields first
 
     // Fill keypair data from received_data
     if (received_data.has_secret_share) {
@@ -210,23 +219,12 @@ static int write_frost_data_to_flash(void) {
         memcpy(flash_data.keypair_group_public_key, received_data.public_key.group_public_key, 33);
     }
 
-    // Fill commitments data
-    if (received_data.has_commitments) {
-        flash_data.commitments_index = received_data.commitment_index;
-        flash_data.commitments_num_coefficients = received_data.num_coefficients;
-        memcpy(flash_data.commitments_zkp_z, received_data.zkp_z, 32);
-        memcpy(flash_data.commitments_zkp_r, received_data.zkp_r, 64);
-        memcpy(flash_data.commitments_coefficient_data, received_data.coefficient_commitments, 
-               received_data.coefficient_commitments_size);
-        flash_data.commitments_coefficient_data_size = received_data.coefficient_commitments_size;
-    }
-
     // Get flash device details
     const struct device *flash_dev = flash_area_get_device(fa);
     if (!device_is_ready(flash_dev)) {
         LOG_ERR("Flash device not ready");
         flash_area_close(fa);
-        return -1;
+        return -ENODEV;
     }
 
     // Get erase block size
@@ -238,8 +236,25 @@ static int write_frost_data_to_flash(void) {
         return rc;
     }
 
-    // Erase flash sector
+    LOG_INF("Flash info: offset=0x%lx, size=%zu, page_size=%zu", 
+            (unsigned long)fa->fa_off, fa->fa_size, info.size);
+
+    // Validate flash area size
+    if (fa->fa_size < sizeof(frost_flash_storage_t)) {
+        LOG_ERR("Flash area too small: %zu < %zu", fa->fa_size, sizeof(frost_flash_storage_t));
+        flash_area_close(fa);
+        return -ENOSPC;
+    }
+
+    // Calculate erase size - must be multiple of page size
     size_t erase_size = ROUND_UP(sizeof(frost_flash_storage_t), info.size);
+    if (erase_size > fa->fa_size) {
+        erase_size = fa->fa_size;
+    }
+
+    LOG_INF("Erasing %zu bytes from flash", erase_size);
+
+    // Erase flash sector
     rc = flash_area_erase(fa, 0, erase_size);
     if (rc != 0) {
         LOG_ERR("Failed to erase flash (%d)", rc);
@@ -247,10 +262,15 @@ static int write_frost_data_to_flash(void) {
         return rc;
     }
 
-    // Prepare padded write buffer
+    // Get write alignment requirements
     size_t write_block_size = flash_get_write_block_size(flash_dev);
     size_t padded_size = ROUND_UP(sizeof(frost_flash_storage_t), write_block_size);
-    uint8_t padded_buf[padded_size];
+    
+    LOG_INF("Writing %zu bytes to flash (padded to %zu, write_block=%zu)", 
+            sizeof(frost_flash_storage_t), padded_size, write_block_size);
+
+    // Use stack buffer with proper alignment
+    __aligned(4) uint8_t padded_buf[padded_size];
     memset(padded_buf, 0xFF, padded_size);
     memcpy(padded_buf, &flash_data, sizeof(frost_flash_storage_t));
 
@@ -262,8 +282,25 @@ static int write_frost_data_to_flash(void) {
         return rc;
     }
 
-    LOG_INF("FROST key material written to flash.");
+    // Verify write
+    frost_flash_storage_t verify_data;
+    rc = flash_area_read(fa, 0, &verify_data, sizeof(frost_flash_storage_t));
+    if (rc != 0) {
+        LOG_ERR("Failed to verify flash read (%d)", rc);
+        flash_area_close(fa);
+        return rc;
+    }
+    
+    if (memcmp(&flash_data, &verify_data, sizeof(frost_flash_storage_t)) != 0) {
+        LOG_ERR("Flash verification failed!");
+        flash_area_close(fa);
+        return -EIO;
+    }
+
+    // Clean up
     flash_area_close(fa);
+    
+    LOG_INF("FROST key material written and verified successfully");
     return 0;
 }
 
@@ -274,6 +311,13 @@ static int read_frost_data_from_flash(void) {
     if (rc < 0) {
         LOG_ERR("Failed to open flash area (%d)", rc);
         return rc;
+    }
+
+    // Validate flash area size
+    if (fa->fa_size < sizeof(frost_flash_storage_t)) {
+        LOG_ERR("Flash area too small for data structure");
+        flash_area_close(fa);
+        return -ENOSPC;
     }
 
     // Read back stored data
@@ -287,37 +331,52 @@ static int read_frost_data_from_flash(void) {
 
     // Log keypair information
     LOG_INF("=== Stored Keypair ===");
-    LOG_INF("Participant Index: %d", flash_data.keypair_index);
-    LOG_INF("Max Participants: %d", flash_data.keypair_max_participants);
+    LOG_INF("Participant Index: %u", flash_data.keypair_index);
+    LOG_INF("Max Participants: %u", flash_data.keypair_max_participants);
     
-    // Log secret and public keys in hex
-    char hex_buf[129];
-    for (int i = 0; i < 32; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_secret[i]);
-    }
-    hex_buf[64] = '\0';
-    LOG_INF("Secret Share: %s", hex_buf);
+    // Helper function to log full hex data
+    #define LOG_FULL_HEX(label, data, len) do { \
+        char hex_buf[(len)*2 + 1]; \
+        for (size_t i = 0; i < (len); i++) { \
+            sprintf(&hex_buf[i * 2], "%02x", (data)[i]); \
+        } \
+        hex_buf[(len)*2] = '\0'; \
+        LOG_INF("%s (%zu bytes): %s", label, len, hex_buf); \
+    } while (0)
 
-    for (int i = 0; i < 64; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_public_key[i]);
-    }
-    hex_buf[128] = '\0';
-    LOG_INF("Public Key: %s", hex_buf);
+    // Log full secret share
+    LOG_FULL_HEX("Secret Share", flash_data.keypair_secret, 32);
 
-    for (int i = 0; i < 33; i++) {
-        sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_group_public_key[i]);
-    }
-    hex_buf[66] = '\0';
-    LOG_INF("Group Public Key: %s", hex_buf);
+    // Log full public key
+    LOG_FULL_HEX("Public Key", flash_data.keypair_public_key, 64);
 
-    // Log commitments info
-    LOG_INF("=== Stored Commitments ===");
-    LOG_INF("Commitments Index: %d", flash_data.commitments_index);
-    LOG_INF("Num Coefficients: %d", flash_data.commitments_num_coefficients);
-    LOG_INF("Coefficient Data Size: %zu", flash_data.commitments_coefficient_data_size);
+    // Log full group public key
+    LOG_FULL_HEX("Group Public Key", flash_data.keypair_group_public_key, 33);
 
+    // Clean up
     flash_area_close(fa);
     return 0;
+}
+
+// Work handler for flash operations (runs in thread context)
+static void flash_work_handler(struct k_work *work)
+{
+    LOG_INF("Starting flash write operation...");
+    
+    // Write received data to flash
+    int rc = write_frost_data_to_flash();
+    
+    if (rc == 0) {
+        LOG_INF("Data successfully stored to flash");
+        // Read back and verify the data
+        read_frost_data_from_flash();
+        report_1.value = 0xFF;  // Success indicator
+    } else {
+        LOG_ERR("Failed to store data to flash");
+        report_1.value = 0xEE;  // Error indicator
+    }
+    
+    received_data.flash_write_pending = false;
 }
 
 // Function to safely process a complete message
@@ -430,16 +489,10 @@ static void process_message(const uint8_t *data, size_t len)
                 received_data.has_commitments) {
                 LOG_INF("SUCCESS: All data received!");
                 
-                // Write received data to flash
-                int rc = write_frost_data_to_flash();
-                if (rc == 0) {
-                    LOG_INF("Data successfully stored to flash");
-                    // Read back and verify the data
-                    read_frost_data_from_flash();
-                    report_1.value = 0xFF;  // Success indicator
-                } else {
-                    LOG_ERR("Failed to store data to flash");
-                    report_1.value = 0xEE;  // Error indicator
+                // Schedule flash write in thread context
+                if (!received_data.flash_write_pending) {
+                    received_data.flash_write_pending = true;
+                    k_work_submit(&flash_work);
                 }
             } else {
                 LOG_WRN("INCOMPLETE data received");
@@ -466,7 +519,7 @@ static void receive_timeout_handler(struct k_timer *timer)
     }
 }
 
-// NEW: Enhanced chunked data handler
+// Enhanced chunked data handler
 static void handle_chunked_data(const uint8_t *data, size_t len)
 {
     if (!data || len < 3) {  // Report ID + Length + at least 1 byte data
@@ -679,10 +732,13 @@ int main(void)
 {
 	int ret;
 
-	LOG_INF("=== FROST Key Receiver with Chunked Protocol Starting ===");
+	LOG_INF("=== FROST HID Key Receiver Starting ===");
 	
 	// Initialize data structure
 	memset(&received_data, 0, sizeof(received_data));
+    
+    // Initialize flash work queue
+    k_work_init(&flash_work, flash_work_handler);
 
 	hdev = device_get_binding("HID_0");
 	if (hdev == NULL) {
@@ -709,7 +765,7 @@ int main(void)
 
 	k_work_init(&report_send, send_report);
 
-	LOG_INF("=== FROST Receiver with Chunked Protocol Ready ===");
+	LOG_INF("=== FROST HID Receiver Ready ===");
 	LOG_INF("Reassembly buffer size: %d bytes", REASSEMBLY_BUFFER_SIZE);
 	return 0;
 }
