@@ -49,7 +49,8 @@ typedef enum {
     MSG_TYPE_ALL_NONCE_COMMITMENTS = 0x05,  
     MSG_TYPE_READY = 0x06,            
     MSG_TYPE_END_TRANSMISSION = 0xFF,
-    MSG_TYPE_SIGN = 0x07              // Nuevo tipo para fase de firma
+    MSG_TYPE_SIGN = 0x07,
+    MSG_TYPE_SIGNATURE_SHARE = 0x08   // Para recibir signature shares
 } message_type_t;
 
 // Header for each message in our protocol
@@ -72,6 +73,14 @@ typedef struct {
 } serialized_nonce_commitment_t;
 #pragma pack(pop)
 
+// Signature share structure
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t participant_index;
+    uint8_t response[32];
+} serialized_signature_share_t;
+#pragma pack(pop)
+
 // Helper function to print hex data
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
@@ -79,6 +88,15 @@ void print_hex(const char *label, const unsigned char *data, size_t len) {
         printf("%02x", data[i]);
     }
     if (len > 8) printf("...");
+    printf("\n");
+}
+
+// Helper function to print full hex data
+void print_full_hex(const char *label, const unsigned char *data, size_t len) {
+    printf("%s: ", label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
     printf("\n");
 }
 
@@ -475,7 +493,7 @@ HANDLE setup_uart_port(const char *port_name) {
 
     COMMTIMEOUTS timeouts = {0};
     timeouts.ReadIntervalTimeout = 100;
-    timeouts.ReadTotalTimeoutConstant = 5000; // 5 second timeout
+    timeouts.ReadTotalTimeoutConstant = 10000; // 10 second timeout
     timeouts.ReadTotalTimeoutMultiplier = 10;
     timeouts.WriteTotalTimeoutConstant = 1000;
     timeouts.WriteTotalTimeoutMultiplier = 10;
@@ -559,11 +577,16 @@ void compute_message_hash(unsigned char* msg_hash, const unsigned char* msg, siz
 
 // ================== MAIN PROGRAM ==================
 int main(void) {
-    printf("=== FROST Signature Coordinator ===\n\n");
+    printf("=== FROST Signature Coordinator with Immediate Share Collection ===\n\n");
     
     serialized_nonce_commitment_t commitments[N];
+    serialized_signature_share_t signature_shares[N];
     int commitments_received = 0;
+    int shares_received = 0;
     uint8_t receive_buffer[1024];
+    
+    // Initialize signature shares array
+    memset(signature_shares, 0, sizeof(signature_shares));
     
     // Mensaje a firmar
     unsigned char msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
@@ -622,6 +645,7 @@ int main(void) {
         // Break early if we have enough commitments
         if (commitments_received >= T) {
             printf("\nReceived minimum %d commitments. Continuing...\n", T);
+            break;
         }
     }
     
@@ -642,17 +666,17 @@ int main(void) {
         print_hex("  Binding", commitments[i].binding, 32);
     }
     
-    // Fase 2: Enviar hash y compromisos a cada dispositivo
-    printf("\n=== Sending Signing Data to Devices ===\n");
+    // Fase 2: Enviar hash y compromisos a cada dispositivo Y recibir signature shares inmediatamente
+    printf("\n=== Sending Signing Data and Collecting Signature Shares ===\n");
     
     for (int i = 0; i < T; i++) {
         uint32_t participant_index = commitments[i].participant_index;
-        printf("\n=== Sending to Participant %u ===\n", participant_index);
+        printf("\n=== Processing Participant %u ===\n", participant_index);
         
         // Setup communication
         comm_handle_t comm = setup_communication(participant_index);
         if (comm.type == 0) {
-            printf("Skipping participant %d due to communication failure\n", participant_index);
+            printf("Skipping participant %u due to communication failure\n", participant_index);
             continue;
         }
         
@@ -675,6 +699,9 @@ int main(void) {
         printf("Sending signing data to participant %u...\n", participant_index);
         if (!send_message(&comm, MSG_TYPE_SIGN, participant_index, payload, payload_len)) {
             printf("Failed to send signing data to participant %u\n", participant_index);
+            free(payload);
+            close_communication(&comm);
+            continue;
         } else {
             printf("Signing data sent successfully to participant %u\n", participant_index);
             printf("  Message hash sent: ");
@@ -683,11 +710,87 @@ int main(void) {
         }
         
         free(payload);
+        
+        // Inmediatamente después de enviar, esperar por la signature share
+        printf("Waiting for signature share from participant %u...\n", participant_index);
+        
+        message_header_t* header;
+        void* payload_response;
+        DWORD start_time = GetTickCount();
+        DWORD timeout_ms = 20000; // 20 second timeout
+        BOOL received_share = FALSE;
+        
+        while (!received_share && (GetTickCount() - start_time) < timeout_ms) {
+            if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), 
+                                       &header, &payload_response)) {
+                if (header->msg_type == MSG_TYPE_SIGNATURE_SHARE && 
+                    header->payload_len == sizeof(serialized_signature_share_t)) {
+                    
+                    // Store the signature share
+                    serialized_signature_share_t* sig_share = (serialized_signature_share_t*)payload_response;
+                    memcpy(&signature_shares[shares_received], sig_share, sizeof(serialized_signature_share_t));
+                    
+                    printf("\n*** SIGNATURE SHARE RECEIVED from Participant %u ***\n", 
+                           sig_share->participant_index);
+                    print_full_hex("Signature Share", sig_share->response, 32);
+                    
+                    // Print signature share in a formatted way
+                    printf("\n=== FROST SIGNATURE SHARE %d ===\n", shares_received + 1);
+                    printf("Participant: %u\n", sig_share->participant_index);
+                    printf("Share: ");
+                    for (int j = 0; j < 32; j++) {
+                        printf("%02x", sig_share->response[j]);
+                    }
+                    printf("\n");
+                    printf("===============================\n\n");
+                    
+                    shares_received++;
+                    received_share = TRUE;
+                } else if (header->msg_type == MSG_TYPE_END_TRANSMISSION) {
+                    printf("Received end transmission marker\n");
+                } else {
+                    printf("Received unexpected message type: 0x%02X (expected signature share)\n", 
+                           header->msg_type);
+                }
+            }
+            
+            // Small delay before retrying
+            Sleep(100);
+        }
+        
+        if (!received_share) {
+            printf("*** TIMEOUT: No signature share received from participant %u ***\n", participant_index);
+        }
+        
         close_communication(&comm);
     }
     
-    printf("\n=== Signing Data Transmission Complete ===\n");
-    printf("Press Enter to exit...\n");
+    printf("\n=== Signing Process Complete ===\n");
+    
+    if (shares_received >= T) {
+        printf("\n=== SIGNATURE SHARE COLLECTION COMPLETE ===\n");
+        printf("Successfully collected signature shares from %d participants:\n\n", shares_received);
+        
+        for (int i = 0; i < shares_received; i++) {
+            if (signature_shares[i].participant_index != 0) {
+                printf("Participant %u Signature Share:\n", signature_shares[i].participant_index);
+                printf("  ");
+                for (int j = 0; j < 32; j++) {
+                    printf("%02x", signature_shares[i].response[j]);
+                }
+                printf("\n\n");
+            }
+        }
+        
+        printf("All signature shares have been collected and displayed.\n");
+        printf("These shares can now be aggregated to form the final FROST signature.\n");
+    } else {
+        printf("\n=== INCOMPLETE SIGNATURE COLLECTION ===\n");
+        printf("Only received %d signature shares out of %d required.\n", shares_received, T);
+        printf("Some devices may have failed to compute or send their shares.\n");
+    }
+    
+    printf("\nPress Enter to exit...\n");
     getchar();
     return 0;
 }

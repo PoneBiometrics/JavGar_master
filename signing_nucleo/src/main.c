@@ -77,6 +77,10 @@ static secp256k1_frost_keypair keypair;
 static secp256k1_frost_nonce *current_nonce = NULL;
 static bool keypair_loaded = false;
 
+// Store computed signature share
+static secp256k1_frost_signature_share computed_signature_share;
+static bool signature_share_computed = false;
+
 // Receive state management
 typedef enum {
     WAITING_FOR_HEADER,
@@ -251,6 +255,35 @@ static bool send_nonce_commitment(void) {
     return result;
 }
 
+// Function to send signature share
+static bool send_signature_share(void) {
+    if (!signature_share_computed) {
+        LOG_ERR("No signature share computed yet");
+        return false;
+    }
+
+    serialized_signature_share_t serialized;
+    serialized.participant_index = keypair.public_keys.index;
+    memcpy(serialized.response, computed_signature_share.response, 32);
+
+    LOG_INF("*** SENDING SIGNATURE SHARE ***");
+    log_hex("Signature Share", serialized.response, 32);
+
+    bool result = send_message(MSG_TYPE_SIGNATURE_SHARE, 
+                              keypair.public_keys.index,
+                              &serialized, sizeof(serialized));
+    
+    if (result) {
+        LOG_INF("Signature share sent successfully to coordinator");
+        // Send end transmission marker
+        send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
+    } else {
+        LOG_ERR("Failed to send signature share");
+    }
+    
+    return result;
+}
+
 // Process READY message
 static void process_ready_message() {
     LOG_INF("*** Received READY signal ***");
@@ -301,27 +334,37 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
     }
     
     // Compute signature share
-    secp256k1_frost_signature_share signature_share;
-    int return_val = secp256k1_frost_sign(&signature_share,
+    int return_val = secp256k1_frost_sign(&computed_signature_share,
                                          msg_hash, num_commitments,
                                          &keypair, current_nonce, signing_commitments);
     
     if (return_val == 1) {
+        signature_share_computed = true;
+        
         LOG_INF("*** SIGNATURE SHARE COMPUTED SUCCESSFULLY ***");
-        log_hex("SIGNATURE SHARE (32 bytes)", signature_share.response, 32);
+        log_hex("SIGNATURE SHARE (32 bytes)", computed_signature_share.response, 32);
         
         // Print signature share in hex format
         char hex_str[65];
         for (int i = 0; i < 32; i++) {
-            sprintf(hex_str + i * 2, "%02x", signature_share.response[i]);
+            sprintf(hex_str + i * 2, "%02x", computed_signature_share.response[i]);
         }
         hex_str[64] = '\0';
         printk("\n\n=== FROST SIGNATURE SHARE ===\n");
         printk("Participant: %u\n", keypair.public_keys.index);
         printk("Signature: %s\n", hex_str);
         printk("=============================\n\n");
+        
+        // Wait a moment then send the signature share to the coordinator
+        k_msleep(1000);
+        LOG_INF("Sending signature share to coordinator...");
+        if (!send_signature_share()) {
+            LOG_ERR("Failed to send signature share to coordinator");
+        }
+        
     } else {
         LOG_ERR("Failed to compute signature share");
+        signature_share_computed = false;
     }
     
     // Clean up

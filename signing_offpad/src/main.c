@@ -75,12 +75,17 @@ static bool configured = false;
 static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 static struct k_work sign_work;
+static struct k_work send_share_work;
 static frost_flash_storage_t flash_data;
 static bool flash_data_valid = false;
 static uint8_t chunk_buffer[HID_REPORT_SIZE];
 static secp256k1_context *secp256k1_ctx;
 static secp256k1_frost_keypair keypair;
 static secp256k1_frost_nonce *current_nonce = NULL;
+
+// Store computed signature share
+static secp256k1_frost_signature_share computed_signature_share;
+static bool signature_share_computed = false;
 
 // Receive buffer for accumulating messages
 static uint8_t receive_buffer[512];
@@ -454,6 +459,36 @@ static int send_nonce_commitment(void) {
     return ret;
 }
 
+// Send signature share to coordinator
+static int send_signature_share(void) {
+    if (!signature_share_computed) {
+        LOG_ERR("No signature share computed yet");
+        return -1;
+    }
+
+    serialized_signature_share_t serialized = {
+        .participant_index = keypair.public_keys.index
+    };
+    memcpy(serialized.response, computed_signature_share.response, 32);
+
+    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR ***");
+    log_hex("Signature Share", serialized.response, 32);
+
+    int ret = send_message(MSG_TYPE_SIGNATURE_SHARE, 
+                          keypair.public_keys.index,
+                          &serialized, sizeof(serialized));
+    
+    if (ret == 0) {
+        LOG_INF("Signature share sent successfully to coordinator");
+        // Send end transmission marker
+        send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
+    } else {
+        LOG_ERR("Failed to send signature share to coordinator");
+    }
+    
+    return ret;
+}
+
 // Process signing data and compute signature share
 static void process_sign_message(void) {
     const message_header_t *header = (const message_header_t *)receive_buffer;
@@ -500,31 +535,54 @@ static void process_sign_message(void) {
     }
     
     // Compute signature share
-    secp256k1_frost_signature_share signature_share;
-    int return_val = secp256k1_frost_sign(&signature_share,
+    int return_val = secp256k1_frost_sign(&computed_signature_share,
                                          msg_hash, num_commitments,
                                          &keypair, current_nonce, signing_commitments);
     
     if (return_val == 1) {
+        signature_share_computed = true;
+        
         LOG_INF("*** SIGNATURE SHARE COMPUTED SUCCESSFULLY ***");
-        log_hex("SIGNATURE SHARE (32 bytes)", signature_share.response, 32);
+        log_hex("SIGNATURE SHARE (32 bytes)", computed_signature_share.response, 32);
         
         // Print signature share to console
         char hex_str[65];
         for (int i = 0; i < 32; i++) {
-            sprintf(hex_str + i * 2, "%02x", signature_share.response[i]);
+            sprintf(hex_str + i * 2, "%02x", computed_signature_share.response[i]);
         }
         hex_str[64] = '\0';
         printk("\n\n=== FROST SIGNATURE SHARE ===\n");
         printk("Participant: %u\n", keypair.public_keys.index);
         printk("Signature: %s\n", hex_str);
         printk("=============================\n\n");
+        
+        // Schedule work to send signature share to coordinator
+        k_work_submit(&send_share_work);
+        
     } else {
         LOG_ERR("Failed to compute signature share");
+        signature_share_computed = false;
     }
     
     // Clean up
     free(signing_commitments);
+}
+
+// Work handler for sending signature share
+static void send_share_work_handler(struct k_work *work) {
+    if (!configured || !flash_data_valid || !signature_share_computed) {
+        LOG_ERR("Device not ready for sending signature share");
+        return;
+    }
+    
+    LOG_INF("Sending signature share to coordinator...");
+    
+    // Wait a moment before sending to ensure coordinator is ready
+    k_msleep(1000);
+    
+    if (send_signature_share() != 0) {
+        LOG_ERR("Failed to send signature share to coordinator");
+    }
 }
 
 // Work handler
@@ -568,8 +626,9 @@ int main(void) {
         return -1;
     }
     
-    // Initialize work queue
+    // Initialize work queues
     k_work_init(&sign_work, sign_work_handler);
+    k_work_init(&send_share_work, send_share_work_handler);
     
     // Read flash data
     if (read_frost_data_from_flash() != 0) {
