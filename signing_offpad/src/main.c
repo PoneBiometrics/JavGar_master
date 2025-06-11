@@ -35,7 +35,8 @@ typedef enum {
     MSG_TYPE_NONCE_COMMITMENT  = 0x04,
     MSG_TYPE_END_TRANSMISSION  = 0xFF,
     MSG_TYPE_READY             = 0x06,
-    MSG_TYPE_SIGN              = 0x07  // Nuevo tipo para firma
+    MSG_TYPE_SIGN              = 0x07,
+    MSG_TYPE_SIGNATURE_SHARE   = 0x08
 } message_type_t;
 
 // Message header
@@ -53,6 +54,12 @@ typedef struct {
     uint8_t hiding[32];
     uint8_t binding[32];
 } __packed serialized_nonce_commitment_t;
+
+// Signature share structure
+typedef struct {
+    uint32_t participant_index;
+    uint8_t response[32];
+} __packed serialized_signature_share_t;
 
 // Flash storage structure
 typedef struct {
@@ -73,6 +80,7 @@ static bool flash_data_valid = false;
 static uint8_t chunk_buffer[HID_REPORT_SIZE];
 static secp256k1_context *secp256k1_ctx;
 static secp256k1_frost_keypair keypair;
+static secp256k1_frost_nonce *current_nonce = NULL;
 
 // Receive buffer for accumulating messages
 static uint8_t receive_buffer[512];
@@ -109,6 +117,53 @@ static const uint8_t hid_report_desc[] = {
 static bool fill_random(unsigned char *data, size_t len) {
     sys_csrand_get(data, len);
     return true;
+}
+
+// Helper function to log hex data
+static void log_hex(const char *label, const uint8_t *data, size_t len) {
+    char hexstr[129]; // Enough for 64 bytes
+    size_t print_len = (len > 64) ? 64 : len;
+    
+    for (size_t i = 0; i < print_len; i++) {
+        snprintf(&hexstr[i * 2], 3, "%02x", data[i]);
+    }
+    hexstr[print_len * 2] = '\0';
+    
+    if (len > 64) {
+        LOG_INF("%s (first 64 bytes): %s...", label, hexstr);
+    } else {
+        LOG_INF("%s: %s", label, hexstr);
+    }
+}
+
+// Generate nonce at startup
+static void generate_nonce(void) {
+    unsigned char binding_seed[32] = {0};
+    unsigned char hiding_seed[32] = {0};
+    
+    if (!fill_random(binding_seed, sizeof(binding_seed))) {
+        LOG_ERR("Failed to generate binding_seed");
+        return;
+    }
+    if (!fill_random(hiding_seed, sizeof(hiding_seed))) {
+        LOG_ERR("Failed to generate hiding_seed");
+        return;
+    }
+
+    if (current_nonce != NULL) {
+        secp256k1_frost_nonce_destroy(current_nonce);
+    }
+    
+    current_nonce = secp256k1_frost_nonce_create(
+        secp256k1_ctx, &keypair, binding_seed, hiding_seed);
+    
+    if (current_nonce) {
+        LOG_INF("Generated nonce at startup");
+        log_hex("Nonce hiding", current_nonce->commitments.hiding, 32);
+        log_hex("Nonce binding", current_nonce->commitments.binding, 32);
+    } else {
+        LOG_ERR("Failed to generate nonce at startup");
+    }
 }
 
 // Process accumulated message data
@@ -379,47 +434,43 @@ static int send_message(uint8_t msg_type, uint32_t participant,
 
 // Generate and send nonce commitment
 static int send_nonce_commitment(void) {
-    unsigned char binding_seed[32] = {0};
-    unsigned char hiding_seed[32] = {0};
-    
-    if (!fill_random(binding_seed, sizeof(binding_seed)) ||
-        !fill_random(hiding_seed, sizeof(hiding_seed))) {
-        LOG_ERR("Failed to generate randomness");
-        return -1;
-    }
-    
-    LOG_INF("Generating nonce commitment for participant %u", keypair.public_keys.index);
-    
-    secp256k1_frost_nonce *nonce = secp256k1_frost_nonce_create(
-        secp256k1_ctx, &keypair, binding_seed, hiding_seed);
-    if (!nonce) {
-        LOG_ERR("Failed to create nonce");
+    if (!current_nonce) {
+        LOG_ERR("No nonce available to send commitment");
         return -1;
     }
     
     serialized_nonce_commitment_t serialized = {
         .participant_index = keypair.public_keys.index
     };
-    memcpy(serialized.hiding, nonce->commitments.hiding, 32);
-    memcpy(serialized.binding, nonce->commitments.binding, 32);
+    memcpy(serialized.hiding, current_nonce->commitments.hiding, 32);
+    memcpy(serialized.binding, current_nonce->commitments.binding, 32);
     
-    LOG_INF("Nonce commitment generated successfully");
+    LOG_INF("Sending nonce commitment for participant %u", keypair.public_keys.index);
     
     int ret = send_message(MSG_TYPE_NONCE_COMMITMENT, 
                           keypair.public_keys.index,
                           &serialized, sizeof(serialized));
     
-    secp256k1_frost_nonce_destroy(nonce);
     return ret;
 }
 
-// Process signing data
+// Process signing data and compute signature share
 static void process_sign_message(void) {
     const message_header_t *header = (const message_header_t *)receive_buffer;
     const uint8_t* payload = receive_buffer + sizeof(message_header_t);
     
     if (header->payload_len < 32 + 4) {
         LOG_ERR("Invalid sign message length");
+        return;
+    }
+    
+    if (!current_nonce) {
+        LOG_ERR("No nonce available for signing");
+        return;
+    }
+    
+    if (current_nonce->used) {
+        LOG_ERR("Nonce already used");
         return;
     }
     
@@ -434,13 +485,46 @@ static void process_sign_message(void) {
             msg_hash[4], msg_hash[5], msg_hash[6], msg_hash[7]);
     LOG_INF("Number of commitments: %u", num_commitments);
     
-    for (uint32_t i = 0; i < num_commitments; i++) {
-        LOG_INF("Commitment %u: participant %u", i, serialized_commitments[i].participant_index);
-        LOG_HEXDUMP_INF(serialized_commitments[i].hiding, 8, "  Hiding (first 8): ");
-        LOG_HEXDUMP_INF(serialized_commitments[i].binding, 8, "  Binding (first 8): ");
+    // Convert serialized commitments to secp256k1_frost_nonce_commitment array
+    secp256k1_frost_nonce_commitment *signing_commitments = 
+        malloc(num_commitments * sizeof(secp256k1_frost_nonce_commitment));
+    if (!signing_commitments) {
+        LOG_ERR("Failed to allocate memory for signing commitments");
+        return;
     }
     
-    LOG_INF("Signing data received successfully");
+    for (uint32_t i = 0; i < num_commitments; i++) {
+        signing_commitments[i].index = serialized_commitments[i].participant_index;
+        memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 32);
+        memcpy(signing_commitments[i].binding, serialized_commitments[i].binding, 32);
+    }
+    
+    // Compute signature share
+    secp256k1_frost_signature_share signature_share;
+    int return_val = secp256k1_frost_sign(&signature_share,
+                                         msg_hash, num_commitments,
+                                         &keypair, current_nonce, signing_commitments);
+    
+    if (return_val == 1) {
+        LOG_INF("*** SIGNATURE SHARE COMPUTED SUCCESSFULLY ***");
+        log_hex("SIGNATURE SHARE (32 bytes)", signature_share.response, 32);
+        
+        // Print signature share to console
+        char hex_str[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(hex_str + i * 2, "%02x", signature_share.response[i]);
+        }
+        hex_str[64] = '\0';
+        printk("\n\n=== FROST SIGNATURE SHARE ===\n");
+        printk("Participant: %u\n", keypair.public_keys.index);
+        printk("Signature: %s\n", hex_str);
+        printk("=============================\n\n");
+    } else {
+        LOG_ERR("Failed to compute signature share");
+    }
+    
+    // Clean up
+    free(signing_commitments);
 }
 
 // Work handler
@@ -499,6 +583,9 @@ int main(void) {
         return -1;
     }
     
+    // Generate nonce at startup
+    generate_nonce();
+    
     // Initialize USB HID
     hdev = device_get_binding("HID_0");
     if (hdev == NULL) {
@@ -525,6 +612,12 @@ int main(void) {
     while (1) {
         k_msleep(1000);
     }
+    
+    // Cleanup (never reached)
+    if (current_nonce) {
+        secp256k1_frost_nonce_destroy(current_nonce);
+    }
+    secp256k1_context_destroy(secp256k1_ctx);
     
     return 0;
 }
