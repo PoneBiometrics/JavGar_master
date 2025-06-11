@@ -6,18 +6,38 @@
 #include <secp256k1_frost.h>
 #include <windows.h>
 #include <stdbool.h>
+#include <setupapi.h>
+#include <hidsdi.h>
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "hid.lib")
 
 #define N 3 // Number of participants
 #define T 2 // Threshold of needed participants
 
-// Helper function to print hex data
-void print_hex(const char *label, const unsigned char *data, size_t len) {
-    printf("%s: ", label);
-    for (size_t i = 0; i < len; i++) {
-        printf("%02x", data[i]);
-    }
-    printf("\n");
-}
+// USB HID constants - MUST match receiver
+#define VENDOR_ID 0x2FE3   // Nordic Semiconductor
+#define PRODUCT_ID 0x100   // Adjust based on your device
+
+// Communication types
+typedef enum {
+    COMM_TYPE_UART = 1,
+    COMM_TYPE_USB_HID = 2
+} communication_type_t;
+
+// Communication handle wrapper
+typedef struct {
+    communication_type_t type;
+    union {
+        HANDLE uart_handle;
+        struct {
+            HANDLE hid_handle;
+            PHIDP_PREPARSED_DATA preparsed_data;
+            HIDP_CAPS capabilities;
+            USHORT output_report_length;
+            USHORT input_report_length;
+        };
+    };
+} comm_handle_t;
 
 // Constants for message protocol
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
@@ -25,431 +45,589 @@ void print_hex(const char *label, const unsigned char *data, size_t len) {
 
 // Message types for our protocol
 typedef enum {
-    MSG_TYPE_SECRET_SHARE = 0x01,
-    MSG_TYPE_PUBLIC_KEY = 0x02,
-    MSG_TYPE_COMMITMENTS = 0x03,
     MSG_TYPE_NONCE_COMMITMENT = 0x04,  
     MSG_TYPE_ALL_NONCE_COMMITMENTS = 0x05,  
+    MSG_TYPE_READY = 0x06,            
     MSG_TYPE_END_TRANSMISSION = 0xFF
 } message_type_t;
 
 // Header for each message in our protocol
+#pragma pack(push, 1)
 typedef struct {
     uint32_t magic;        // Magic number to identify our protocol
     uint8_t version;       // Protocol version
     uint8_t msg_type;      // Type of message
     uint16_t payload_len;  // Length of payload following the header
     uint32_t participant;  // Participant ID 
-} __attribute__((packed)) message_header_t;
+} message_header_t;
+#pragma pack(pop)
 
 // Nonce commitment structure 
+#pragma pack(push, 1)
 typedef struct {
     uint32_t participant_index;
     uint8_t hiding[32];     
     uint8_t binding[32];    
-} __attribute__((packed)) serialized_nonce_commitment_t;
+} serialized_nonce_commitment_t;
+#pragma pack(pop)
 
-// Structure for all nonce commitments to be sent to boards
-typedef struct {
-    uint32_t num_commitments;  
-    serialized_nonce_commitment_t commitments[N];  // Array of all commitments
-} __attribute__((packed)) all_nonce_commitments_t;
+// Helper function to print hex data
+void print_hex(const char *label, const unsigned char *data, size_t len) {
+    printf("%s: ", label);
+    for (size_t i = 0; i < len && i < 8; i++) {
+        printf("%02x", data[i]);
+    }
+    if (len > 8) printf("...");
+    printf("\n");
+}
 
-// Function to send a message with header and payload
-BOOL send_message(HANDLE hSerial, uint8_t msg_type, uint32_t participant, 
-                  const void* payload, uint16_t payload_len) {
-    DWORD bytes_written;
-    message_header_t header;
+// ================== HID HELPER FUNCTIONS ==================
+comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
+    comm_handle_t comm = {0};
+    GUID hid_guid;
+    HDEVINFO device_info_set;
+    SP_DEVICE_INTERFACE_DATA device_interface_data;
+    PSP_DEVICE_INTERFACE_DETAIL_DATA device_interface_detail_data;
+    DWORD required_size;
+
+    printf("Looking for HID device with VID:0x%04X PID:0x%04X\n", vendor_id, product_id);
+
+    HidD_GetHidGuid(&hid_guid);
+    device_info_set = SetupDiGetClassDevs(&hid_guid, NULL, NULL, 
+                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (device_info_set == INVALID_HANDLE_VALUE) {
+        printf("Failed to get device information set. Error: %lu\n", GetLastError());
+        return comm;
+    }
+
+    device_interface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
     
-    // Fill header
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(device_info_set, NULL, &hid_guid, 
+                                                  i, &device_interface_data); i++) {
+        SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data, 
+                                       NULL, 0, &required_size, NULL);
+        device_interface_detail_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(required_size);
+        if (!device_interface_detail_data) continue;
+        device_interface_detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+
+        if (SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data,
+                                           device_interface_detail_data, required_size,
+                                           NULL, NULL)) {
+            
+            printf("Trying device path: %s\n", device_interface_detail_data->DevicePath);
+            
+            // Try different access modes for better compatibility
+            DWORD access_modes[] = {
+                GENERIC_READ | GENERIC_WRITE,
+                GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE | FILE_SHARE_READ | FILE_SHARE_WRITE
+            };
+            
+            HANDLE temp_handle = INVALID_HANDLE_VALUE;
+            
+            for (int mode_idx = 0; mode_idx < 3 && temp_handle == INVALID_HANDLE_VALUE; mode_idx++) {
+                temp_handle = CreateFile(device_interface_detail_data->DevicePath,
+                                       access_modes[mode_idx],
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       NULL, OPEN_EXISTING, 0, NULL);
+                
+                if (temp_handle == INVALID_HANDLE_VALUE) {
+                    DWORD error = GetLastError();
+                    printf("  Access mode %d failed. Error: %lu\n", mode_idx, error);
+                }
+            }
+            
+            if (temp_handle != INVALID_HANDLE_VALUE) {
+                printf("  Device opened successfully\n");
+                
+                HIDD_ATTRIBUTES attributes;
+                attributes.Size = sizeof(HIDD_ATTRIBUTES);
+                if (HidD_GetAttributes(temp_handle, &attributes)) {
+                    printf("  Device attributes: VID:0x%04X PID:0x%04X Ver:0x%04X\n", 
+                           attributes.VendorID, attributes.ProductID, attributes.VersionNumber);
+                    
+                    if (attributes.VendorID == vendor_id && attributes.ProductID == product_id) {
+                        printf("  MATCH FOUND!\n");
+                        
+                        PHIDP_PREPARSED_DATA preparsed_data;
+                        if (HidD_GetPreparsedData(temp_handle, &preparsed_data)) {
+                            HIDP_CAPS capabilities;
+                            if (HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS) {
+                                printf("  Device capabilities:\n");
+                                printf("    Usage Page: 0x%04X\n", capabilities.UsagePage);
+                                printf("    Usage: 0x%04X\n", capabilities.Usage);
+                                printf("    Input Report Length: %d\n", capabilities.InputReportByteLength);
+                                printf("    Output Report Length: %d\n", capabilities.OutputReportByteLength);
+                                
+                                comm.type = COMM_TYPE_USB_HID;
+                                comm.hid_handle = temp_handle;
+                                comm.preparsed_data = preparsed_data;
+                                comm.capabilities = capabilities;
+                                comm.output_report_length = capabilities.OutputReportByteLength;
+                                comm.input_report_length = capabilities.InputReportByteLength;
+                                
+                                free(device_interface_detail_data);
+                                SetupDiDestroyDeviceInfoList(device_info_set);
+                                return comm;
+                            } else {
+                                printf("  Failed to get HID capabilities\n");
+                            }
+                            HidD_FreePreparsedData(preparsed_data);
+                        } else {
+                            printf("  Failed to get preparsed data\n");
+                        }
+                    } else {
+                        printf("  VID/PID mismatch\n");
+                    }
+                } else {
+                    printf("  Failed to get device attributes. Error: %lu\n", GetLastError());
+                }
+                CloseHandle(temp_handle);
+            } else {
+                printf("  Failed to open device. Error: %lu\n", GetLastError());
+            }
+        } else {
+            printf("Failed to get device interface detail. Error: %lu\n", GetLastError());
+        }
+        free(device_interface_detail_data);
+    }
+
+    SetupDiDestroyDeviceInfoList(device_info_set);
+    printf("Target device not found.\n");
+    return comm;
+}
+
+BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
+    const uint8_t* data_ptr = (const uint8_t*)data;
+    size_t bytes_sent = 0;
+    
+    printf("Sending %zu bytes via HID (Report Length: %d)\n", len, comm->output_report_length);
+    
+    while (bytes_sent < len) {
+        uint8_t* report = (uint8_t*)calloc(1, comm->output_report_length);
+        if (!report) {
+            printf("Failed to allocate report buffer\n");
+            return FALSE;
+        }
+        
+        // Set report ID
+        report[0] = 0x02;
+        
+        // Calculate chunk size - leave room for report ID and length byte
+        size_t available_space = comm->output_report_length - 2; // -1 for report ID, -1 for length
+        size_t remaining = len - bytes_sent;
+        size_t chunk_size = (available_space < remaining) ? available_space : remaining;
+        
+        // Set the actual data length in the second byte
+        report[1] = (uint8_t)chunk_size;
+        
+        // Copy data to report buffer starting at byte 2
+        memcpy(report + 2, data_ptr + bytes_sent, chunk_size);
+        
+        printf("Sending chunk %zu bytes (sent: %zu/%zu), full report: %d bytes\n", 
+               chunk_size, bytes_sent, len, comm->output_report_length);
+        
+        // Try HidD_SetOutputReport first
+        if (!HidD_SetOutputReport(comm->hid_handle, report, comm->output_report_length)) {
+            DWORD error = GetLastError();
+            printf("HidD_SetOutputReport failed. Error: %lu. Trying WriteFile...\n", error);
+            
+            // Try alternative method using WriteFile
+            DWORD bytes_written;
+            OVERLAPPED overlapped = {0};
+            overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            
+            if (overlapped.hEvent) {
+                BOOL write_result = WriteFile(comm->hid_handle, report, comm->output_report_length, 
+                                            &bytes_written, &overlapped);
+                if (!write_result) {
+                    DWORD write_error = GetLastError();
+                    if (write_error == ERROR_IO_PENDING) {
+                        // Wait for completion
+                        DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 5000);
+                        if (wait_result == WAIT_OBJECT_0) {
+                            if (GetOverlappedResult(comm->hid_handle, &overlapped, &bytes_written, FALSE)) {
+                                printf("WriteFile method succeeded (%lu bytes)\n", bytes_written);
+                                write_result = TRUE;
+                            } else {
+                                printf("GetOverlappedResult failed. Error: %lu\n", GetLastError());
+                            }
+                        } else {
+                            printf("WriteFile timeout. Wait result: %lu\n", wait_result);
+                        }
+                    } else {
+                        printf("WriteFile failed immediately. Error: %lu\n", write_error);
+                    }
+                }
+                CloseHandle(overlapped.hEvent);
+                
+                if (!write_result) {
+                    printf("Both HID send methods failed\n");
+                    free(report);
+                    return FALSE;
+                }
+            } else {
+                printf("Failed to create event for overlapped I/O\n");
+                free(report);
+                return FALSE;
+            }
+        } else {
+            printf("HidD_SetOutputReport succeeded\n");
+        }
+        
+        free(report);
+        bytes_sent += chunk_size;
+        
+        // Delay between chunks to prevent overwhelming the receiver
+        Sleep(200);
+    }
+    
+    printf("Successfully sent all %zu bytes in HID chunks\n", bytes_sent);
+    return TRUE;
+}
+
+// Enhanced receive function with chunked data support
+BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len, size_t* total_received) {
+    uint8_t* recv_buffer = (uint8_t*)buffer;
+    *total_received = 0;
+    
+    while (*total_received < max_len) {
+        uint8_t* report = (uint8_t*)calloc(1, comm->input_report_length);
+        if (!report) return FALSE;
+        
+        DWORD bytes_read;
+        if (!ReadFile(comm->hid_handle, report, comm->input_report_length, &bytes_read, NULL)) {
+            free(report);
+            return FALSE;
+        }
+        
+        if (bytes_read > 0) {
+            // Parse chunked data: [Report ID][Length][Data...]
+            uint8_t report_id = report[0];
+            if (report_id == 0x01 && bytes_read >= 3) { // Input report with data
+                uint8_t chunk_len = report[1];
+                if (chunk_len > 0 && chunk_len <= (bytes_read - 2)) {
+                    size_t copy_len = (*total_received + chunk_len <= max_len) ? chunk_len : (max_len - *total_received);
+                    memcpy(recv_buffer + *total_received, report + 2, copy_len);
+                    *total_received += copy_len;
+                    
+                    printf("Received chunk: %u bytes (total: %zu)\n", chunk_len, *total_received);
+                    
+                    // Check if this looks like a complete message
+                    if (*total_received >= sizeof(message_header_t)) {
+                        message_header_t* header = (message_header_t*)recv_buffer;
+                        if (header->magic == MSG_HEADER_MAGIC) {
+                            size_t expected_total = sizeof(message_header_t) + header->payload_len;
+                            if (*total_received >= expected_total) {
+                                printf("Complete message received (%zu bytes)\n", expected_total);
+                                *total_received = expected_total; // Trim to exact message size
+                                free(report);
+                                return TRUE;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        free(report);
+        
+        // Timeout after reasonable wait
+        Sleep(100);
+        static int timeout_counter = 0;
+        if (++timeout_counter > 50) { // 5 second timeout
+            printf("Timeout waiting for complete message\n");
+            timeout_counter = 0;
+            break;
+        }
+    }
+    
+    return (*total_received > 0);
+}
+
+// ================== GENERIC COMMUNICATION FUNCTIONS ==================
+BOOL send_data(comm_handle_t* comm, const void* data, size_t len) {
+    switch (comm->type) {
+        case COMM_TYPE_UART: {
+            DWORD bytes_written;
+            return WriteFile(comm->uart_handle, data, (DWORD)len, &bytes_written, NULL) 
+                   && bytes_written == len;
+        }
+        case COMM_TYPE_USB_HID:
+            return send_hid_data(comm, data, len);
+        default:
+            return FALSE;
+    }
+}
+
+BOOL receive_data(comm_handle_t* comm, void* buffer, size_t max_len, size_t* bytes_read) {
+    switch (comm->type) {
+        case COMM_TYPE_UART: {
+            DWORD bytes_read_now;
+            if (!ReadFile(comm->uart_handle, buffer, (DWORD)max_len, &bytes_read_now, NULL)) {
+                return FALSE;
+            }
+            *bytes_read = bytes_read_now;
+            return TRUE;
+        }
+        case COMM_TYPE_USB_HID:
+            return receive_hid_data_chunked(comm, buffer, max_len, bytes_read);
+        default:
+            return FALSE;
+    }
+}
+
+// ================== MESSAGE FUNCTIONS ==================
+BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant, 
+                  const void* payload, uint16_t payload_len) {
+    message_header_t header;
     header.magic = MSG_HEADER_MAGIC;
     header.version = MSG_VERSION;
     header.msg_type = msg_type;
     header.payload_len = payload_len;
     header.participant = participant;
     
-    // Send header
-    if (!WriteFile(hSerial, &header, sizeof(header), &bytes_written, NULL) || 
-        bytes_written != sizeof(header)) {
-        printf("Failed to send header. Error: %lu\n", GetLastError());
-        return FALSE;
+    size_t total_size = sizeof(header) + payload_len;
+    uint8_t* combined_buffer = (uint8_t*)malloc(total_size);
+    if (!combined_buffer) return FALSE;
+    
+    memcpy(combined_buffer, &header, sizeof(header));
+    if (payload_len > 0 && payload) {
+        memcpy(combined_buffer + sizeof(header), payload, payload_len);
     }
     
-    // Send payload
-    if (payload_len > 0) {
-        if (!WriteFile(hSerial, payload, payload_len, &bytes_written, NULL) || 
-            bytes_written != payload_len) {
-            printf("Failed to send payload. Error: %lu\n", GetLastError());
-            return FALSE;
-        }
-    }
+    printf("Sending message: type=0x%02X, participant=%u, len=%u\n", 
+           msg_type, participant, payload_len);
     
-    return TRUE;
-}
-
-// Function to receive a message header
-BOOL receive_header(HANDLE hSerial, message_header_t *header) {
-    DWORD bytes_read;
+    BOOL result = send_data(comm, combined_buffer, total_size);
+    free(combined_buffer);
     
-    // Read header
-    if (!ReadFile(hSerial, header, sizeof(message_header_t), &bytes_read, NULL) || 
-        bytes_read != sizeof(message_header_t)) {
-        printf("Failed to read header. Error: %lu\n", GetLastError());
-        return FALSE;
-    }
-    
-    // Check magic number
-    if (header->magic != MSG_HEADER_MAGIC) {
-        printf("Invalid message header. Magic number mismatch.\n");
-        return FALSE;
-    }
-    
-    // Check version
-    if (header->version != MSG_VERSION) {
-        printf("Unsupported protocol version: %d\n", header->version);
-        return FALSE;
-    }
-    
-    return TRUE;
-}
-
-// Function to receive a nonce commitment
-BOOL receive_nonce_commitment(HANDLE hSerial, message_header_t *header, 
-                              serialized_nonce_commitment_t *commitment) {
-    DWORD bytes_read;
-    
-    // Verify payload length
-    if (header->payload_len != sizeof(serialized_nonce_commitment_t)) {
-        printf("Invalid payload length for nonce commitment: %d\n", header->payload_len);
-        return FALSE;
-    }
-    
-    // Read commitment data
-    if (!ReadFile(hSerial, commitment, sizeof(serialized_nonce_commitment_t), 
-                  &bytes_read, NULL) || 
-        bytes_read != sizeof(serialized_nonce_commitment_t)) {
-        printf("Failed to read nonce commitment. Error: %lu\n", GetLastError());
-        return FALSE;
-    }
-    
-    return TRUE;
-}
-
-// Function to open and configure the serial port
-HANDLE setup_serial_port(const char *port_name) {
-    HANDLE hSerial = CreateFile(port_name,
-        GENERIC_READ | GENERIC_WRITE,  // Need read and write permission
-        0,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
-    
-    if (hSerial == INVALID_HANDLE_VALUE) {
-        printf("Failed to open COM port %s. Error: %lu\n", port_name, GetLastError());
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    // Configure serial port settings
-    DCB dcbSerialParams = {0};
-    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-    if (!GetCommState(hSerial, &dcbSerialParams)) {
-        printf("Error getting port state\n");
-        CloseHandle(hSerial);
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    dcbSerialParams.BaudRate = CBR_115200;
-    dcbSerialParams.ByteSize = 8;
-    dcbSerialParams.StopBits = ONESTOPBIT;
-    dcbSerialParams.Parity = NOPARITY;
-    
-    if (!SetCommState(hSerial, &dcbSerialParams)) {
-        printf("Error setting port state\n");
-        CloseHandle(hSerial);
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    // Set timeouts
-    COMMTIMEOUTS timeouts = {0};
-    timeouts.ReadIntervalTimeout = 50;
-    timeouts.ReadTotalTimeoutConstant = 2000;  // Increased timeout for reading
-    timeouts.ReadTotalTimeoutMultiplier = 10;
-    timeouts.WriteTotalTimeoutConstant = 50;
-    timeouts.WriteTotalTimeoutMultiplier = 10;
-    
-    if (!SetCommTimeouts(hSerial, &timeouts)) {
-        printf("Error setting timeouts\n");
-        CloseHandle(hSerial);
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    // Purge any existing data in buffers
-    if (!PurgeComm(hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR)) {
-        printf("Error purging comm port\n");
-        CloseHandle(hSerial);
-        return INVALID_HANDLE_VALUE;
-    }
-    
-    return hSerial;
-}
-
-// Function to discard any existing bytes in the buffer
-void flush_serial(HANDLE hSerial) {
-    PurgeComm(hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
-}
-
-// Function to read a specific number of bytes with timeout
-BOOL read_exact_bytes(HANDLE hSerial, void *buffer, DWORD size, DWORD *bytes_read) {
-    DWORD total_read = 0;
-    DWORD bytes_read_now;
-    char *buf = (char*)buffer;
-    
-    while (total_read < size) {
-        if (!ReadFile(hSerial, buf + total_read, size - total_read, &bytes_read_now, NULL)) {
-            printf("Read failed. Error: %lu\n", GetLastError());
-            *bytes_read = total_read;
-            return FALSE;
-        }
-        
-        if (bytes_read_now == 0) {
-            // Timeout occurred
-            printf("Read timeout. Read %lu of %lu bytes.\n", total_read, size);
-            *bytes_read = total_read;
-            return FALSE;
-        }
-        
-        total_read += bytes_read_now;
-    }
-    
-    *bytes_read = total_read;
-    return TRUE;
-}
-
-// Function to receive nonce commitments from a board
-BOOL receive_nonce_commitments_from_board(HANDLE hSerial, 
-                                         serialized_nonce_commitment_t *commitment) {
-    message_header_t header;
-    BOOL result = FALSE;
-    DWORD bytes_read;
-    
-    while (1) {
-        // Read header
-        printf("Waiting for message...\n");
-        if (!receive_header(hSerial, &header)) {
-            printf("Failed to receive header. Retrying...\n");
-            Sleep(1000);  // Wait a bit before retrying
-            continue;
-        }
-        
-        printf("Received message: Type=%d, Length=%d, Participant=%d\n", 
-               header.msg_type, header.payload_len, header.participant);
-        
-        // Process based on message type
-        if (header.msg_type == MSG_TYPE_NONCE_COMMITMENT) {
-            if (!receive_nonce_commitment(hSerial, &header, commitment)) {
-                printf("Failed to receive nonce commitment\n");
-                return FALSE;
-            }
-            
-            printf("Received Nonce Commitment from Participant %d\n", commitment->participant_index);
-            print_hex("  Hiding Commitment", commitment->hiding, sizeof(commitment->hiding));
-            print_hex("  Binding Commitment", commitment->binding, sizeof(commitment->binding));
-            
-            result = TRUE;
-            break;
-        } else if (header.msg_type == MSG_TYPE_END_TRANSMISSION) {
-            printf("End of transmission received from Participant %d\n", header.participant);
-            return FALSE;
-        } else {
-            // Skip unknown payload data
-            if (header.payload_len > 0) {
-                printf("Unknown message type %d. Skipping %d bytes of payload\n", 
-                       header.msg_type, header.payload_len);
-                
-                // Allocate buffer for unknown payload
-                uint8_t *buffer = (uint8_t*)malloc(header.payload_len);
-                if (!buffer) {
-                    printf("Memory allocation failed\n");
-                    return FALSE;
-                }
-                
-                // Read and discard payload
-                result = read_exact_bytes(hSerial, buffer, header.payload_len, &bytes_read);
-                free(buffer);
-                
-                if (!result) {
-                    printf("Failed to skip payload for unknown message type\n");
-                    return FALSE;
-                }
-            }
-        }
+    if (result) {
+        printf("Message sent successfully\n");
+        Sleep(500); // Delay after sending
     }
     
     return result;
 }
 
-// Function to send all nonce commitments to a board
-BOOL send_all_nonce_commitments(HANDLE hSerial, uint32_t participant_id,
-                               all_nonce_commitments_t *all_commitments) {
-    return send_message(hSerial, MSG_TYPE_ALL_NONCE_COMMITMENTS, participant_id,
-                       all_commitments, sizeof(all_nonce_commitments_t));
+BOOL receive_complete_message(comm_handle_t* comm, uint8_t* buffer, size_t max_len, 
+                              message_header_t** header, void** payload) {
+    size_t bytes_received;
+    if (!receive_data(comm, buffer, max_len, &bytes_received)) {
+        return FALSE;
+    }
+    
+    if (bytes_received < sizeof(message_header_t)) {
+        printf("Received incomplete message (%zu bytes)\n", bytes_received);
+        return FALSE;
+    }
+    
+    *header = (message_header_t*)buffer;
+    
+    // Validate header
+    if ((*header)->magic != MSG_HEADER_MAGIC || (*header)->version != MSG_VERSION) {
+        printf("Invalid message header: magic=0x%08x, version=%d\n", 
+               (*header)->magic, (*header)->version);
+        return FALSE;
+    }
+    
+    // Set payload pointer
+    if ((*header)->payload_len > 0) {
+        *payload = buffer + sizeof(message_header_t);
+    } else {
+        *payload = NULL;
+    }
+    
+    printf("Received valid message: type=0x%02X, len=%u\n", 
+           (*header)->msg_type, (*header)->payload_len);
+    
+    return TRUE;
 }
 
-// Structure to hold board communication handles and participant IDs
-typedef struct {
-    HANDLE serial_handle;
-    uint32_t participant_id;
-    char port_name[10];
-} board_connection_t;
+// ================== SERIAL PORT SETUP ==================
+HANDLE setup_uart_port(const char *port_name) {
+    HANDLE hSerial = CreateFile(port_name,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL);
+    if (hSerial == INVALID_HANDLE_VALUE) {
+        return INVALID_HANDLE_VALUE;
+    }
 
+    DCB dcbSerialParams = {0};
+    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+    if (!GetCommState(hSerial, &dcbSerialParams)) {
+        CloseHandle(hSerial);
+        return INVALID_HANDLE_VALUE;
+    }
+    dcbSerialParams.BaudRate = CBR_115200;
+    dcbSerialParams.ByteSize = 8;
+    dcbSerialParams.StopBits = ONESTOPBIT;
+    dcbSerialParams.Parity = NOPARITY;
+    if (!SetCommState(hSerial, &dcbSerialParams)) {
+        CloseHandle(hSerial);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    COMMTIMEOUTS timeouts = {0};
+    timeouts.ReadIntervalTimeout = 100;
+    timeouts.ReadTotalTimeoutConstant = 5000; // 5 second timeout
+    timeouts.ReadTotalTimeoutMultiplier = 10;
+    timeouts.WriteTotalTimeoutConstant = 1000;
+    timeouts.WriteTotalTimeoutMultiplier = 10;
+    if (!SetCommTimeouts(hSerial, &timeouts)) {
+        CloseHandle(hSerial);
+        return INVALID_HANDLE_VALUE;
+    }
+    return hSerial;
+}
+
+comm_handle_t setup_communication(int participant_id) {
+    comm_handle_t comm = {0};
+    
+    printf("\n=== Setting up communication for participant %d ===\n", participant_id);
+    printf("Select communication method:\n");
+    printf("1. UART/Serial (COM port)\n");
+    printf("2. USB HID\n");
+    printf("Enter choice (1 or 2): ");
+    
+    int choice;
+    scanf("%d", &choice);
+    getchar();
+    
+    switch (choice) {
+        case 1: {
+            printf("Enter COM port (e.g., COM4): ");
+            char port_name[10];
+            scanf("%9s", port_name);
+            getchar();
+            
+            HANDLE uart_handle = setup_uart_port(port_name);
+            if (uart_handle != INVALID_HANDLE_VALUE) {
+                comm.type = COMM_TYPE_UART;
+                comm.uart_handle = uart_handle;
+                printf("UART communication set up on %s\n", port_name);
+            } else {
+                printf("Failed to open UART port %s\n", port_name);
+            }
+            break;
+        }
+        case 2: {
+            printf("Searching for USB HID device (VID:0x%04X, PID:0x%04X)...\n", 
+                   VENDOR_ID, PRODUCT_ID);
+            comm = find_hid_device(VENDOR_ID, PRODUCT_ID);
+            if (comm.type != 0) {
+                printf("USB HID device found!\n");
+                printf("Waiting for device to stabilize...\n");
+                Sleep(1000); // Give device time to stabilize
+            } else {
+                printf("USB HID device not found\n");
+            }
+            break;
+        }
+        default:
+            printf("Invalid choice\n");
+            break;
+    }
+    return comm;
+}
+
+void close_communication(comm_handle_t* comm) {
+    if (comm->type == COMM_TYPE_UART && comm->uart_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(comm->uart_handle);
+    } else if (comm->type == COMM_TYPE_USB_HID && comm->hid_handle != INVALID_HANDLE_VALUE) {
+        if (comm->preparsed_data) {
+            HidD_FreePreparsedData(comm->preparsed_data);
+        }
+        CloseHandle(comm->hid_handle);
+    }
+    memset(comm, 0, sizeof(comm_handle_t));
+}
+
+// ================== MAIN PROGRAM ==================
 int main(void) {
     printf("=== FROST Nonce Commitment Coordinator ===\n\n");
     
-    // Array to store board connections
-    board_connection_t boards[N];
-    int active_boards = 0;
+    serialized_nonce_commitment_t commitments[N];
+    int commitments_received = 0;
+    uint8_t receive_buffer[1024];
     
-    // Collect port names for all boards
+    // Collect nonce commitments from each participant
     for (int i = 0; i < N; i++) {
-        printf("Enter COM port for board %d (e.g., COM4) or leave empty to skip: ", i+1);
-        char port_name[10];
-        fgets(port_name, sizeof(port_name), stdin);
+        printf("\n=== Processing Participant %d ===\n", i+1);
         
-        // Remove newline character if present
-        size_t len = strlen(port_name);
-        if (len > 0 && port_name[len-1] == '\n') {
-            port_name[len-1] = '\0';
-            len--;
-        }
-        
-        // Skip if empty
-        if (len == 0) {
-            printf("Skipping board %d\n", i+1);
+        // Setup communication
+        comm_handle_t comm = setup_communication(i+1);
+        if (comm.type == 0) {
+            printf("Skipping participant %d due to communication failure\n", i+1);
             continue;
         }
         
-        // Copy port name
-        strncpy(boards[active_boards].port_name, port_name, sizeof(boards[active_boards].port_name));
-        boards[active_boards].participant_id = i+1;  
-        active_boards++;
-    }
-    
-    // Check if we have enough boards
-    if (active_boards < T) {
-        printf("Error: Need at least %d boards, but only %d provided.\n", T, active_boards);
-        return 1;
-    }
-    
-    // Open serial ports for each active board
-    for (int i = 0; i < active_boards; i++) {
-        boards[i].serial_handle = setup_serial_port(boards[i].port_name);
-        if (boards[i].serial_handle == INVALID_HANDLE_VALUE) {
-            printf("Failed to set up serial port %s for board %d.\n", 
-                   boards[i].port_name, boards[i].participant_id);
-            
-            // Close previously opened ports
-            for (int j = 0; j < i; j++) {
-                CloseHandle(boards[j].serial_handle);
+        // Send READY signal to trigger nonce generation
+        printf("Sending READY signal to participant %d...\n", i+1);
+        if (!send_message(&comm, MSG_TYPE_READY, i+1, NULL, 0)) {
+            printf("Failed to send READY signal to participant %d\n", i+1);
+            close_communication(&comm);
+            continue;
+        }
+        
+        // Wait for nonce commitment response
+        printf("Waiting for nonce commitment from participant %d...\n", i+1);
+        
+        message_header_t* header;
+        void* payload;
+        
+        if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), &header, &payload)) {
+            if (header->msg_type == MSG_TYPE_NONCE_COMMITMENT && 
+                header->payload_len == sizeof(serialized_nonce_commitment_t)) {
+                
+                // Store the commitment
+                memcpy(&commitments[commitments_received], payload, sizeof(serialized_nonce_commitment_t));
+                
+                printf("Received nonce commitment from participant %d (index: %u)\n", 
+                       i+1, commitments[commitments_received].participant_index);
+                print_hex("  Hiding", commitments[commitments_received].hiding, 32);
+                print_hex("  Binding", commitments[commitments_received].binding, 32);
+                
+                commitments_received++;
+            } else {
+                printf("Received unexpected message type: 0x%02X\n", header->msg_type);
             }
-            return 1;
-        }
-        
-        // Flush any existing data
-        flush_serial(boards[i].serial_handle);
-    }
-    
-    printf("\nPress Enter to begin receiving nonce commitments...\n");
-    getchar();
-    
-    // Prepare data structure to collect all nonce commitments
-    all_nonce_commitments_t all_commitments;
-    all_commitments.num_commitments = 0;
-    
-    // Receive nonce commitments from T boards
-    int commitments_received = 0;
-    for (int i = 0; i < active_boards && commitments_received < T; i++) {
-        printf("\nReceiving nonce commitment from board %d (Participant %d)...\n", 
-               i+1, boards[i].participant_id);
-        
-        if (receive_nonce_commitments_from_board(boards[i].serial_handle, 
-                                              &all_commitments.commitments[commitments_received])) {
-            commitments_received++;
-            all_commitments.num_commitments = commitments_received;
-            
-            printf("Successfully received nonce commitment (%d of %d needed)\n", 
-                   commitments_received, T);
         } else {
-            printf("Failed to receive nonce commitment from board %d\n", i+1);
+            printf("Failed to receive nonce commitment from participant %d\n", i+1);
+        }
+        
+        // Close communication
+        close_communication(&comm);
+        
+        // Break early if we have enough commitments
+        if (commitments_received >= T) {
+            printf("\nReceived minimum %d commitments. Continuing...\n", T);
         }
     }
     
-    // Check if we received enough commitments
     if (commitments_received < T) {
-        printf("\nError: Received only %d nonce commitments, but need at least %d.\n", 
+        printf("\nError: Received only %d commitments, need at least %d\n", 
                commitments_received, T);
-        
-        // Close all serial ports
-        for (int i = 0; i < active_boards; i++) {
-            CloseHandle(boards[i].serial_handle);
-        }
+        printf("Press Enter to exit...\n");
+        getchar();
         return 1;
     }
     
-    printf("\nSuccessfully received %d nonce commitments.\n", commitments_received);
-    
-    // Copy commitments into secp256k1_frost_nonce_commitment format
-    printf("\nCopying commitments to secp256k1_frost_nonce_commitment format...\n");
-    
-    // Set up the frost nonce array and signing commitments
-    secp256k1_frost_nonce_commitment signing_commitments[N];
-    
-    // Initialize the signing_commitments array to zeros
-    memset(signing_commitments, 0, sizeof(signing_commitments));
-    
-    // Copy received commitments into the signing_commitments array
+    // Display summary
+    printf("\n=== FROST Nonce Commitment Collection Complete ===\n");
+    printf("Collected %d nonce commitments:\n", commitments_received);
     for (int i = 0; i < commitments_received; i++) {
-        uint32_t index = all_commitments.commitments[i].participant_index - 1;
-        
-        // Create a frost nonce commitment from the serialized data
-        secp256k1_frost_nonce_commitment commitment;
-        
-        // Copy hiding and binding values to the nonce commitment structure
-        memcpy(commitment.hiding, all_commitments.commitments[i].hiding, 32);
-        memcpy(commitment.binding, all_commitments.commitments[i].binding, 32);
-        
-        // Store in the signing_commitments array
-        memcpy(&signing_commitments[index], &commitment, sizeof(secp256k1_frost_nonce_commitment));
-        
-        printf("Processed commitment %d for participant %d\n", i+1, index+1);
+        printf("Participant %u:\n", commitments[i].participant_index);
+        print_hex("  Hiding", commitments[i].hiding, 32);
+        print_hex("  Binding", commitments[i].binding, 32);
     }
     
-    printf("\nNow sending all collected nonce commitments to each board...\n");
-    
-    // Send all nonce commitments to each board
-    for (int i = 0; i < active_boards; i++) {
-        printf("Sending all nonce commitments to board %d (Participant %d)...\n", 
-               i+1, boards[i].participant_id);
-        
-        if (send_all_nonce_commitments(boards[i].serial_handle, boards[i].participant_id, 
-                                     &all_commitments)) {
-            printf("Successfully sent all nonce commitments to board %d\n", i+1);
-            
-            // Send end transmission message
-            send_message(boards[i].serial_handle, MSG_TYPE_END_TRANSMISSION, 
-                       boards[i].participant_id, NULL, 0);
-        } else {
-            printf("Failed to send all nonce commitments to board %d\n", i+1);
-        }
-    }
-    
-    // Clean up
-    for (int i = 0; i < active_boards; i++) {
-        CloseHandle(boards[i].serial_handle);
-    }
-    
-    printf("\nAll operations completed. Press Enter to exit...\n");
+    printf("\nNow you can proceed with FROST signing using these commitments.\n");
+    printf("Press Enter to exit...\n");
     getchar();
-    
     return 0;
 }
