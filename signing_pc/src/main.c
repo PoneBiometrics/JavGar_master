@@ -48,7 +48,8 @@ typedef enum {
     MSG_TYPE_NONCE_COMMITMENT = 0x04,  
     MSG_TYPE_ALL_NONCE_COMMITMENTS = 0x05,  
     MSG_TYPE_READY = 0x06,            
-    MSG_TYPE_END_TRANSMISSION = 0xFF
+    MSG_TYPE_END_TRANSMISSION = 0xFF,
+    MSG_TYPE_SIGN = 0x07              // Nuevo tipo para fase de firma
 } message_type_t;
 
 // Header for each message in our protocol
@@ -547,17 +548,32 @@ void close_communication(comm_handle_t* comm) {
     memset(comm, 0, sizeof(comm_handle_t));
 }
 
+// ================== FROST SIGNING FUNCTIONS ==================
+void compute_message_hash(unsigned char* msg_hash, const unsigned char* msg, size_t msg_len) {
+    secp256k1_context* sign_verify_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '\0', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
+    int return_val = secp256k1_tagged_sha256(sign_verify_ctx, msg_hash, tag, sizeof(tag), msg, msg_len);
+    assert(return_val == 1);
+    secp256k1_context_destroy(sign_verify_ctx);
+}
+
 // ================== MAIN PROGRAM ==================
 int main(void) {
-    printf("=== FROST Nonce Commitment Coordinator ===\n\n");
+    printf("=== FROST Signature Coordinator ===\n\n");
     
     serialized_nonce_commitment_t commitments[N];
     int commitments_received = 0;
     uint8_t receive_buffer[1024];
     
-    // Collect nonce commitments from each participant
+    // Mensaje a firmar
+    unsigned char msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
+    unsigned char msghash[32];
+    compute_message_hash(msghash, msg, sizeof(msg));
+    print_hex("Message Hash", msghash, sizeof(msghash));
+    
+    // Fase 1: Recopilar compromisos de nonce
     for (int i = 0; i < N; i++) {
-        printf("\n=== Processing Participant %d ===\n", i+1);
+        printf("\n=== Processing Participant %d (Nonce Commitment) ===\n", i+1);
         
         // Setup communication
         comm_handle_t comm = setup_communication(i+1);
@@ -626,7 +642,51 @@ int main(void) {
         print_hex("  Binding", commitments[i].binding, 32);
     }
     
-    printf("\nNow you can proceed with FROST signing using these commitments.\n");
+    // Fase 2: Enviar hash y compromisos a cada dispositivo
+    printf("\n=== Sending Signing Data to Devices ===\n");
+    
+    for (int i = 0; i < T; i++) {
+        uint32_t participant_index = commitments[i].participant_index;
+        printf("\n=== Sending to Participant %u ===\n", participant_index);
+        
+        // Setup communication
+        comm_handle_t comm = setup_communication(participant_index);
+        if (comm.type == 0) {
+            printf("Skipping participant %d due to communication failure\n", participant_index);
+            continue;
+        }
+        
+        // Preparar payload: [msghash][num_commitments][commitments...]
+        uint16_t payload_len = 32 + 4 + T * sizeof(serialized_nonce_commitment_t);
+        uint8_t* payload = (uint8_t*)malloc(payload_len);
+        if (!payload) {
+            close_communication(&comm);
+            continue;
+        }
+        
+        // Copiar msghash (32 bytes)
+        memcpy(payload, msghash, 32);
+        // Copiar num_commitments (T)
+        *(uint32_t*)(payload + 32) = T;
+        // Copiar los T compromisos
+        memcpy(payload + 32 + 4, commitments, T * sizeof(serialized_nonce_commitment_t));
+        
+        // Enviar mensaje de firma
+        printf("Sending signing data to participant %u...\n", participant_index);
+        if (!send_message(&comm, MSG_TYPE_SIGN, participant_index, payload, payload_len)) {
+            printf("Failed to send signing data to participant %u\n", participant_index);
+        } else {
+            printf("Signing data sent successfully to participant %u\n", participant_index);
+            printf("  Message hash sent: ");
+            print_hex("", msghash, 8); // Solo primeros 8 bytes
+            printf("  Number of commitments sent: %d\n", T);
+        }
+        
+        free(payload);
+        close_communication(&comm);
+    }
+    
+    printf("\n=== Signing Data Transmission Complete ===\n");
     printf("Press Enter to exit...\n");
     getchar();
     return 0;

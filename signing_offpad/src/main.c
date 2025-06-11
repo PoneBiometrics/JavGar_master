@@ -1,7 +1,3 @@
-/*
- * FROST Nonce Commitment Sender - USB HID Version (Fixed)
- * Waits for READY signal before sending nonce commitments
- */
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
 #include <zephyr/usb/usb_device.h>
@@ -17,7 +13,7 @@
 #include <stdlib.h>
 
 #define LOG_LEVEL LOG_LEVEL_INF
-LOG_MODULE_REGISTER(frost_sender);
+LOG_MODULE_REGISTER(frost_hid_device);
 
 // Flash storage partition
 #define STORAGE_PARTITION storage_partition
@@ -27,7 +23,7 @@ LOG_MODULE_REGISTER(frost_sender);
 #define REPORT_ID_OUTPUT 0x02
 #define HID_EP_BUSY_FLAG 0
 #define HID_REPORT_SIZE  64
-#define CHUNK_SIZE       61    // 64 - 1 (report ID) - 1 (length) - 1 (safety)
+#define CHUNK_SIZE       61
 #define CHUNK_DELAY_MS   50
 
 // Message protocol constants
@@ -38,7 +34,8 @@ LOG_MODULE_REGISTER(frost_sender);
 typedef enum {
     MSG_TYPE_NONCE_COMMITMENT  = 0x04,
     MSG_TYPE_END_TRANSMISSION  = 0xFF,
-    MSG_TYPE_READY             = 0x06
+    MSG_TYPE_READY             = 0x06,
+    MSG_TYPE_SIGN              = 0x07  // Nuevo tipo para firma
 } message_type_t;
 
 // Message header
@@ -70,16 +67,12 @@ typedef struct {
 static bool configured = false;
 static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
-static struct k_work send_work;
+static struct k_work sign_work;
 static frost_flash_storage_t flash_data;
 static bool flash_data_valid = false;
 static uint8_t chunk_buffer[HID_REPORT_SIZE];
 static secp256k1_context *secp256k1_ctx;
 static secp256k1_frost_keypair keypair;
-
-// State variables
-static bool host_ready = false;
-static bool transmission_complete = false;
 
 // Receive buffer for accumulating messages
 static uint8_t receive_buffer[512];
@@ -150,20 +143,22 @@ static void process_received_message(void) {
     }
     
     // Process the message
-    if (header->msg_type == MSG_TYPE_READY) {
-        LOG_INF("*** Received READY signal from host (participant %u) ***", header->participant);
-        host_ready = true;
-        
-        // Trigger transmission if configured
-        if (configured && !transmission_complete) {
-            LOG_INF("*** Triggering nonce transmission ***");
-            k_work_submit(&send_work);
-        } else {
-            LOG_WRN("Cannot trigger transmission: configured=%d, complete=%d", 
-                    configured, transmission_complete);
-        }
-    } else {
-        LOG_DBG("Received message type 0x%02x (not READY)", header->msg_type);
+    const uint8_t* payload = receive_buffer + sizeof(message_header_t);
+    
+    switch (header->msg_type) {
+        case MSG_TYPE_READY:
+            LOG_INF("*** Received READY signal from host (participant %u) ***", header->participant);
+            k_work_submit(&sign_work);
+            break;
+            
+        case MSG_TYPE_SIGN:
+            LOG_INF("*** Received SIGN request from host (participant %u) ***", header->participant);
+            k_work_submit(&sign_work);
+            break;
+            
+        default:
+            LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
+            break;
     }
     
     // Reset buffer after processing
@@ -208,12 +203,6 @@ static void int_out_ready_cb(const struct device *dev) {
                     LOG_DBG("Appended %zu bytes to receive buffer (total: %zu)", 
                             copy_len, receive_buffer_pos);
                     
-                    // Debug: Print what we have so far
-                    if (receive_buffer_pos >= 4) {
-                        uint32_t magic = *(uint32_t*)receive_buffer;
-                        LOG_DBG("Buffer magic: 0x%08X (expected: 0x%08X)", magic, MSG_HEADER_MAGIC);
-                    }
-                    
                     // Try to process the accumulated message
                     process_received_message();
                 } else {
@@ -246,8 +235,6 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
     switch (status) {
     case USB_DC_RESET:
         configured = false;
-        host_ready = false;
-        transmission_complete = false;
         receive_buffer_pos = 0;
         LOG_INF("USB Reset");
         break;
@@ -256,7 +243,7 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
             atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
             configured = true;
             receive_buffer_pos = 0;
-            LOG_INF("USB Configured - Waiting for READY signal");
+            LOG_INF("USB Configured - Ready");
         }
         break;
     default:
@@ -426,46 +413,68 @@ static int send_nonce_commitment(void) {
     return ret;
 }
 
-// Main transmission sequence
-static void perform_transmission(void) {
-    if (transmission_complete) {
+// Process signing data
+static void process_sign_message(void) {
+    const message_header_t *header = (const message_header_t *)receive_buffer;
+    const uint8_t* payload = receive_buffer + sizeof(message_header_t);
+    
+    if (header->payload_len < 32 + 4) {
+        LOG_ERR("Invalid sign message length");
         return;
     }
-    if (!flash_data_valid || !configured || !host_ready) {
-        LOG_ERR("Not ready for transmission");
-        return;
+    
+    // Parse payload: [msghash (32 bytes)][num_commitments (4 bytes)][commitments...]
+    uint8_t* msg_hash = (uint8_t*)payload;
+    uint32_t num_commitments = *(uint32_t*)(payload + 32);
+    serialized_nonce_commitment_t* serialized_commitments = (serialized_nonce_commitment_t*)(payload + 32 + 4);
+    
+    LOG_INF("Received signing request");
+    LOG_INF("Message hash (first 8 bytes): %02x%02x%02x%02x%02x%02x%02x%02x...", 
+            msg_hash[0], msg_hash[1], msg_hash[2], msg_hash[3],
+            msg_hash[4], msg_hash[5], msg_hash[6], msg_hash[7]);
+    LOG_INF("Number of commitments: %u", num_commitments);
+    
+    for (uint32_t i = 0; i < num_commitments; i++) {
+        LOG_INF("Commitment %u: participant %u", i, serialized_commitments[i].participant_index);
+        LOG_HEXDUMP_INF(serialized_commitments[i].hiding, 8, "  Hiding (first 8): ");
+        LOG_HEXDUMP_INF(serialized_commitments[i].binding, 8, "  Binding (first 8): ");
     }
     
-    LOG_INF("=== Starting FROST Transmission ===");
-    
-    k_msleep(100); // Small delay
-    
-    int ret = send_nonce_commitment();
-    if (ret == 0) {
-        LOG_INF("Nonce commitment sent successfully");
-        
-        k_msleep(50);
-        
-        ret = send_message(MSG_TYPE_END_TRANSMISSION, 
-                          keypair.public_keys.index, NULL, 0);
-        if (ret == 0) {
-            LOG_INF("End transmission sent successfully");
-            transmission_complete = true;
-        }
-    }
-    
-    LOG_INF("=== Transmission Complete ===");
-    host_ready = false; // Reset for next cycle
+    LOG_INF("Signing data received successfully");
 }
 
 // Work handler
-static void send_work_handler(struct k_work *work) {
-    perform_transmission();
+static void sign_work_handler(struct k_work *work) {
+    if (!configured || !flash_data_valid) {
+        LOG_ERR("Device not ready for signing");
+        return;
+    }
+    
+    const message_header_t *header = (const message_header_t *)receive_buffer;
+    
+    switch (header->msg_type) {
+        case MSG_TYPE_READY:
+            LOG_INF("Processing READY message");
+            if (send_nonce_commitment() == 0) {
+                // Send end transmission marker
+                send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
+            }
+            break;
+            
+        case MSG_TYPE_SIGN:
+            LOG_INF("Processing SIGN message");
+            process_sign_message();
+            break;
+            
+        default:
+            LOG_WRN("Unknown message type in work handler");
+            break;
+    }
 }
 
 int main(void) {
     int ret;
-    LOG_INF("=== FROST HID Nonce Sender Starting ===");
+    LOG_INF("=== FROST HID Signing Device Starting ===");
     
     // Create secp256k1 context
     secp256k1_ctx = secp256k1_context_create(
@@ -476,7 +485,7 @@ int main(void) {
     }
     
     // Initialize work queue
-    k_work_init(&send_work, send_work_handler);
+    k_work_init(&sign_work, sign_work_handler);
     
     // Read flash data
     if (read_frost_data_from_flash() != 0) {
@@ -510,15 +519,11 @@ int main(void) {
         return ret;
     }
     
-    LOG_INF("=== FROST HID Sender Ready - Waiting for READY signal ===");
+    LOG_INF("=== FROST HID Device Ready ===");
     
     // Main loop
     while (1) {
-        k_msleep(5000);
-        LOG_INF("Status: USB=%s, Host Ready=%s, Flash=%s", 
-                configured ? "OK" : "NO",
-                host_ready ? "YES" : "NO", 
-                flash_data_valid ? "OK" : "NO");
+        k_msleep(1000);
     }
     
     return 0;

@@ -13,7 +13,7 @@
 #include <secp256k1_frost.h>
 #include "examples_util.h"
 
-LOG_MODULE_REGISTER(frost_nonce_sender, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(frost_device, LOG_LEVEL_INF);
 
 #define T 2
 #define UART_DEVICE_NODE DT_NODELABEL(usart1) 
@@ -35,7 +35,8 @@ static const struct device *uart_dev;
 typedef enum {
     MSG_TYPE_NONCE_COMMITMENT = 0x04, 
     MSG_TYPE_READY = 0x06,
-    MSG_TYPE_END_TRANSMISSION = 0xFF
+    MSG_TYPE_END_TRANSMISSION = 0xFF,
+    MSG_TYPE_SIGN = 0x07              // Nuevo tipo para fase de firma
 } message_type_t;
 
 // Message header
@@ -237,6 +238,34 @@ static bool send_nonce_commitment(void) {
     return result;
 }
 
+// Process signing request
+static void process_sign_message(const message_header_t *header, const uint8_t *payload) {
+    if (header->payload_len < 32 + 4) {
+        LOG_ERR("Invalid sign message length");
+        return;
+    }
+    
+    // Parse payload: [msghash (32 bytes)][num_commitments (4 bytes)][commitments...]
+    uint8_t* msg_hash = (uint8_t*)payload;
+    uint32_t num_commitments = *(uint32_t*)(payload + 32);
+    serialized_nonce_commitment_t* serialized_commitments = (serialized_nonce_commitment_t*)(payload + 32 + 4);
+    
+    LOG_INF("Received signing request");
+    LOG_INF("Message hash (first 8 bytes): %02x%02x%02x%02x%02x%02x%02x%02x...", 
+            msg_hash[0], msg_hash[1], msg_hash[2], msg_hash[3],
+            msg_hash[4], msg_hash[5], msg_hash[6], msg_hash[7]);
+    LOG_INF("Number of commitments: %u", num_commitments);
+    
+    for (uint32_t i = 0; i < num_commitments; i++) {
+        LOG_INF("Commitment %u: participant %u", i, serialized_commitments[i].participant_index);
+        LOG_HEXDUMP_INF(serialized_commitments[i].hiding, 8, "  Hiding (first 8): ");
+        LOG_HEXDUMP_INF(serialized_commitments[i].binding, 8, "  Binding (first 8): ");
+    }
+    
+    // Aquí se procesaría la firma en el futuro
+    LOG_INF("Signing data received successfully");
+}
+
 // Process received READY message
 static void process_ready_message(const message_header_t *header) {
     LOG_INF("*** Received READY signal from host (participant %u) ***", header->participant);
@@ -266,6 +295,10 @@ static void process_message(const message_header_t *header, const uint8_t *paylo
             process_ready_message(header);
             break;
         
+        case MSG_TYPE_SIGN:
+            process_sign_message(header, payload);
+            break;
+        
         default:
             LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
             break;
@@ -287,7 +320,7 @@ static void uart_cb(const struct device *dev, void *user_data) {
 
 // Main application
 void main(void) {
-    LOG_INF("=== FROST UART Nonce Commitment Sender Starting ===");
+    LOG_INF("=== FROST UART Signing Device Starting ===");
     
     // Initialize ring buffer
     ring_buf_init(&rx_ring_buf, sizeof(rx_buf), rx_buf);
@@ -320,13 +353,13 @@ void main(void) {
         return;
     }
     
-    LOG_INF("=== Ready to receive READY signal and send nonce commitment ===");
+    LOG_INF("=== Ready to receive messages ===");
     
     uint8_t temp_buf[64];
     size_t bytes_read;
     
     // Main processing loop
-    while (!transmission_complete) {
+    while (1) {
         // Process received data
         if (rx_state == WAITING_FOR_HEADER) {
             // Try to read complete header
@@ -391,8 +424,4 @@ void main(void) {
         // Small delay to prevent busy waiting
         k_msleep(10);
     }
-    
-    // Cleanup
-    secp256k1_context_destroy(ctx);
-    LOG_INF("=== FROST UART nonce commitment sender completed ===");
 }
