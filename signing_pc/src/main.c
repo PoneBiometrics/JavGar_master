@@ -73,12 +73,13 @@ typedef struct {
 } serialized_nonce_commitment_t;
 #pragma pack(pop)
 
-// Updated signature share structure with public key
+// Updated signature share structure with public key AND group public key
 #pragma pack(push, 1)
 typedef struct {
     uint32_t participant_index;
     uint8_t response[32];
     uint8_t public_key[64]; // Public key of the participant
+    uint8_t group_public_key[64]; // Group public key for aggregation
 } serialized_signature_share_t;
 #pragma pack(pop)
 
@@ -592,11 +593,20 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
         return 0;
     }
     
-    // We need to create dummy keypair for aggregation
-    secp256k1_frost_keypair dummy_keypair;
-    memset(&dummy_keypair, 0, sizeof(secp256k1_frost_keypair));
-    dummy_keypair.public_keys.index = 1;
-    dummy_keypair.public_keys.max_participants = N;
+    // Create a real keypair using the first signature share's data
+    secp256k1_frost_keypair real_keypair;
+    memset(&real_keypair, 0, sizeof(secp256k1_frost_keypair));
+    real_keypair.public_keys.index = signature_shares[0].participant_index;
+    real_keypair.public_keys.max_participants = N;
+    
+    // Use the group public key from the first signature share
+    memcpy(real_keypair.public_keys.group_public_key, 
+           signature_shares[0].group_public_key, 64);
+    
+    printf("Using real keypair for aggregation:\n");
+    printf("  Participant index: %u\n", real_keypair.public_keys.index);
+    printf("  Max participants: %u\n", real_keypair.public_keys.max_participants);
+    print_hex("  Group public key", real_keypair.public_keys.group_public_key, 32);
     
     // Create public keys array from received data
     secp256k1_frost_pubkey public_keys[N];
@@ -609,16 +619,17 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
         frost_signature_shares[i].index = signature_shares[i].participant_index;
         memcpy(frost_signature_shares[i].response, signature_shares[i].response, 32);
         
-        // Use received public key
+        // Use received public key and group public key
         public_keys[i].index = signature_shares[i].participant_index;
         public_keys[i].max_participants = N;
         memcpy(public_keys[i].public_key, signature_shares[i].public_key, 64);
-        memset(public_keys[i].group_public_key, 0, 64); // Not used in aggregation
+        memcpy(public_keys[i].group_public_key, signature_shares[i].group_public_key, 64);
         
         printf("Converted signature share %d: participant %u\n", 
                i, frost_signature_shares[i].index);
         print_hex("  Response", frost_signature_shares[i].response, 32);
         print_hex("  Public Key", public_keys[i].public_key, 32);
+        print_hex("  Group Public Key", public_keys[i].group_public_key, 32);
     }
     
     // Convert nonce commitments
@@ -631,11 +642,11 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
                i, signing_commitments[i].index);
     }
     
-    printf("Attempting to aggregate %d signature shares with real public keys...\n", num_shares);
+    printf("Attempting to aggregate %d signature shares with real keypair...\n", num_shares);
     
-    // Attempt aggregation with real public keys
+    // Attempt aggregation with real keypair
     int return_val = secp256k1_frost_aggregate(ctx, final_signature, msg_hash,
-                                              &dummy_keypair, public_keys, 
+                                              &real_keypair, public_keys, 
                                               signing_commitments,
                                               frost_signature_shares, num_shares);
     
@@ -648,20 +659,20 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
         }
         printf("\n");
         
-        // Attempt verification
+        // Attempt verification with the real keypair
         printf("\n=== VERIFYING AGGREGATED SIGNATURE ===\n");
         int is_signature_valid = secp256k1_frost_verify(ctx, final_signature, msg_hash, 
-                                                        &dummy_keypair.public_keys);
+                                                        &real_keypair.public_keys);
         
         printf("Signature verification result: %s\n", 
                is_signature_valid ? "VALID ✓" : "INVALID ✗");
         
         if (is_signature_valid) {
             printf("🎉 SUCCESS: FROST signature is mathematically valid!\n");
-            printf("The signature shares were correctly aggregated.\n");
+            printf("The signature shares were correctly aggregated using real keypair.\n");
         } else {
             printf("⚠️  WARNING: Signature verification failed.\n");
-            printf("This may be due to missing public key information or protocol errors.\n");
+            printf("This may indicate protocol errors or implementation issues.\n");
         }
         
         secp256k1_context_destroy(ctx);
@@ -681,7 +692,7 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
 
 // ================== MAIN PROGRAM ==================
 int main(void) {
-    printf("=== FROST Signature Coordinator with Immediate Share Collection ===\n\n");
+    printf("=== FROST Signature Coordinator with Real Keypair ===\n\n");
     
     serialized_nonce_commitment_t commitments[N];
     serialized_signature_share_t signature_shares[N];
@@ -838,6 +849,7 @@ int main(void) {
                            sig_share->participant_index);
                     print_full_hex("Signature Share", sig_share->response, 32);
                     print_hex("Public Key", sig_share->public_key, 32);
+                    print_hex("Group Public Key", sig_share->group_public_key, 32);
                     
                     // Print signature share in a formatted way
                     printf("\n=== FROST SIGNATURE SHARE %d ===\n", shares_received + 1);
@@ -850,6 +862,11 @@ int main(void) {
                     for (int j = 0; j < 64; j++) {
                         printf("%02x", sig_share->public_key[j]);
                         if (j == 31) printf("\n               "); // New line at half
+                    }
+                    printf("\nGroup Public Key: ");
+                    for (int j = 0; j < 64; j++) {
+                        printf("%02x", sig_share->group_public_key[j]);
+                        if (j == 31) printf("\n                     "); // New line at half
                     }
                     printf("\n===============================\n\n");
                     
@@ -892,11 +909,16 @@ int main(void) {
                     printf("%02x", signature_shares[i].public_key[j]);
                     if (j == 31) printf("\n  "); // New line at half
                 }
+                printf("\nGroup Public Key:\n  ");
+                for (int j = 0; j < 64; j++) {
+                    printf("%02x", signature_shares[i].group_public_key[j]);
+                    if (j == 31) printf("\n  "); // New line at half
+                }
                 printf("\n\n");
             }
         }
         
-        printf("Proceeding to aggregate signature shares with public keys...\n");
+        printf("Proceeding to aggregate signature shares with real keypair...\n");
         
         // ================== SIGNATURE AGGREGATION ==================
         unsigned char final_signature[64];
@@ -915,6 +937,7 @@ int main(void) {
             printf("✓ Signature shares collected: %d/%d\n", shares_received, T);
             printf("✓ Signature aggregation: SUCCESS\n");
             printf("✓ Signature verification: SUCCESS\n");
+            printf("✓ Used real keypair with actual group public key\n");
             printf("══════════════════════════════════════════════════════\n");
             
             printf("\nFinal aggregated FROST signature:\n");
@@ -937,8 +960,8 @@ int main(void) {
             printf("✗ Signature aggregation or verification: FAILED\n");
             printf("═══════════════════════════════════════════════════════\n");
             printf("\nThe signature shares were collected but could not be properly\n");
-            printf("aggregated or verified. This may be due to missing public key\n");
-            printf("information or protocol implementation details.\n");
+            printf("aggregated or verified. This may indicate protocol implementation\n");
+            printf("issues or incompatible signature shares.\n");
         }
         
     } else {
