@@ -73,11 +73,12 @@ typedef struct {
 } serialized_nonce_commitment_t;
 #pragma pack(pop)
 
-// Signature share structure
+// Updated signature share structure with public key
 #pragma pack(push, 1)
 typedef struct {
     uint32_t participant_index;
     uint8_t response[32];
+    uint8_t public_key[64]; // Public key of the participant
 } serialized_signature_share_t;
 #pragma pack(pop)
 
@@ -575,6 +576,109 @@ void compute_message_hash(unsigned char* msg_hash, const unsigned char* msg, siz
     secp256k1_context_destroy(sign_verify_ctx);
 }
 
+// ================== FROST AGGREGATION AND VERIFICATION ==================
+int aggregate_and_verify_signature(serialized_signature_share_t* signature_shares,
+                                   serialized_nonce_commitment_t* commitments,
+                                   int num_shares,
+                                   unsigned char* msg_hash,
+                                   unsigned char* final_signature) {
+    
+    printf("\n=== AGGREGATING SIGNATURE SHARES ===\n");
+    
+    // Create secp256k1 context
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    if (!ctx) {
+        printf("Failed to create secp256k1 context\n");
+        return 0;
+    }
+    
+    // We need to create dummy keypair for aggregation
+    secp256k1_frost_keypair dummy_keypair;
+    memset(&dummy_keypair, 0, sizeof(secp256k1_frost_keypair));
+    dummy_keypair.public_keys.index = 1;
+    dummy_keypair.public_keys.max_participants = N;
+    
+    // Create public keys array from received data
+    secp256k1_frost_pubkey public_keys[N];
+    secp256k1_frost_nonce_commitment signing_commitments[N];
+    secp256k1_frost_signature_share frost_signature_shares[N];
+    
+    // Convert serialized data to secp256k1_frost structures
+    for (int i = 0; i < num_shares; i++) {
+        // Convert signature shares
+        frost_signature_shares[i].index = signature_shares[i].participant_index;
+        memcpy(frost_signature_shares[i].response, signature_shares[i].response, 32);
+        
+        // Use received public key
+        public_keys[i].index = signature_shares[i].participant_index;
+        public_keys[i].max_participants = N;
+        memcpy(public_keys[i].public_key, signature_shares[i].public_key, 64);
+        memset(public_keys[i].group_public_key, 0, 64); // Not used in aggregation
+        
+        printf("Converted signature share %d: participant %u\n", 
+               i, frost_signature_shares[i].index);
+        print_hex("  Response", frost_signature_shares[i].response, 32);
+        print_hex("  Public Key", public_keys[i].public_key, 32);
+    }
+    
+    // Convert nonce commitments
+    for (int i = 0; i < num_shares; i++) {
+        signing_commitments[i].index = commitments[i].participant_index;
+        memcpy(signing_commitments[i].hiding, commitments[i].hiding, 32);
+        memcpy(signing_commitments[i].binding, commitments[i].binding, 32);
+        
+        printf("Converted nonce commitment %d: participant %u\n", 
+               i, signing_commitments[i].index);
+    }
+    
+    printf("Attempting to aggregate %d signature shares with real public keys...\n", num_shares);
+    
+    // Attempt aggregation with real public keys
+    int return_val = secp256k1_frost_aggregate(ctx, final_signature, msg_hash,
+                                              &dummy_keypair, public_keys, 
+                                              signing_commitments,
+                                              frost_signature_shares, num_shares);
+    
+    if (return_val == 1) {
+        printf("*** SIGNATURE AGGREGATION SUCCESSFUL ***\n");
+        printf("Final FROST Signature (64 bytes):\n");
+        for (int i = 0; i < 64; i++) {
+            printf("%02x", final_signature[i]);
+            if ((i + 1) % 32 == 0) printf("\n");
+        }
+        printf("\n");
+        
+        // Attempt verification
+        printf("\n=== VERIFYING AGGREGATED SIGNATURE ===\n");
+        int is_signature_valid = secp256k1_frost_verify(ctx, final_signature, msg_hash, 
+                                                        &dummy_keypair.public_keys);
+        
+        printf("Signature verification result: %s\n", 
+               is_signature_valid ? "VALID ✓" : "INVALID ✗");
+        
+        if (is_signature_valid) {
+            printf("🎉 SUCCESS: FROST signature is mathematically valid!\n");
+            printf("The signature shares were correctly aggregated.\n");
+        } else {
+            printf("⚠️  WARNING: Signature verification failed.\n");
+            printf("This may be due to missing public key information or protocol errors.\n");
+        }
+        
+        secp256k1_context_destroy(ctx);
+        return is_signature_valid;
+    } else {
+        printf("*** SIGNATURE AGGREGATION FAILED ***\n");
+        printf("Error: Could not aggregate signature shares\n");
+        printf("This may indicate:\n");
+        printf("- Incompatible signature shares\n");
+        printf("- Missing or corrupted nonce commitments\n");
+        printf("- Protocol violation\n");
+        
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+}
+
 // ================== MAIN PROGRAM ==================
 int main(void) {
     printf("=== FROST Signature Coordinator with Immediate Share Collection ===\n\n");
@@ -733,6 +837,7 @@ int main(void) {
                     printf("\n*** SIGNATURE SHARE RECEIVED from Participant %u ***\n", 
                            sig_share->participant_index);
                     print_full_hex("Signature Share", sig_share->response, 32);
+                    print_hex("Public Key", sig_share->public_key, 32);
                     
                     // Print signature share in a formatted way
                     printf("\n=== FROST SIGNATURE SHARE %d ===\n", shares_received + 1);
@@ -741,8 +846,12 @@ int main(void) {
                     for (int j = 0; j < 32; j++) {
                         printf("%02x", sig_share->response[j]);
                     }
-                    printf("\n");
-                    printf("===============================\n\n");
+                    printf("\nPublic Key: ");
+                    for (int j = 0; j < 64; j++) {
+                        printf("%02x", sig_share->public_key[j]);
+                        if (j == 31) printf("\n               "); // New line at half
+                    }
+                    printf("\n===============================\n\n");
                     
                     shares_received++;
                     received_share = TRUE;
@@ -778,16 +887,65 @@ int main(void) {
                 for (int j = 0; j < 32; j++) {
                     printf("%02x", signature_shares[i].response[j]);
                 }
+                printf("\nPublic Key:\n  ");
+                for (int j = 0; j < 64; j++) {
+                    printf("%02x", signature_shares[i].public_key[j]);
+                    if (j == 31) printf("\n  "); // New line at half
+                }
                 printf("\n\n");
             }
         }
         
-        printf("All signature shares have been collected and displayed.\n");
-        printf("These shares can now be aggregated to form the final FROST signature.\n");
+        printf("Proceeding to aggregate signature shares with public keys...\n");
+        
+        // ================== SIGNATURE AGGREGATION ==================
+        unsigned char final_signature[64];
+        memset(final_signature, 0, sizeof(final_signature));
+        
+        int aggregation_result = aggregate_and_verify_signature(signature_shares, 
+                                                               commitments,
+                                                               shares_received, 
+                                                               msghash, 
+                                                               final_signature);
+        
+        if (aggregation_result) {
+            printf("\n🎊 FROST SIGNATURE PROTOCOL COMPLETED SUCCESSFULLY! 🎊\n");
+            printf("══════════════════════════════════════════════════════\n");
+            printf("✓ Nonce commitments collected: %d/%d\n", commitments_received, T);
+            printf("✓ Signature shares collected: %d/%d\n", shares_received, T);
+            printf("✓ Signature aggregation: SUCCESS\n");
+            printf("✓ Signature verification: SUCCESS\n");
+            printf("══════════════════════════════════════════════════════\n");
+            
+            printf("\nFinal aggregated FROST signature:\n");
+            for (int i = 0; i < 64; i++) {
+                printf("%02x", final_signature[i]);
+                if (i == 31) printf("\n");
+            }
+            printf("\n\nThis signature represents the collective signing of:\n");
+            printf("Message: \"Hello World!\"\n");
+            printf("Hash: ");
+            for (int i = 0; i < 32; i++) {
+                printf("%02x", msghash[i]);
+            }
+            printf("\n");
+        } else {
+            printf("\n⚠️  FROST SIGNATURE PROTOCOL COMPLETED WITH ISSUES\n");
+            printf("═══════════════════════════════════════════════════════\n");
+            printf("✓ Nonce commitments collected: %d/%d\n", commitments_received, T);
+            printf("✓ Signature shares collected: %d/%d\n", shares_received, T);
+            printf("✗ Signature aggregation or verification: FAILED\n");
+            printf("═══════════════════════════════════════════════════════\n");
+            printf("\nThe signature shares were collected but could not be properly\n");
+            printf("aggregated or verified. This may be due to missing public key\n");
+            printf("information or protocol implementation details.\n");
+        }
+        
     } else {
         printf("\n=== INCOMPLETE SIGNATURE COLLECTION ===\n");
         printf("Only received %d signature shares out of %d required.\n", shares_received, T);
         printf("Some devices may have failed to compute or send their shares.\n");
+        printf("Cannot proceed with signature aggregation.\n");
     }
     
     printf("\nPress Enter to exit...\n");

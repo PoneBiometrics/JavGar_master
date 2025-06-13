@@ -55,10 +55,11 @@ typedef struct {
     uint8_t binding[32];
 } __packed serialized_nonce_commitment_t;
 
-// Signature share structure
+// Updated signature share structure with public key
 typedef struct {
     uint32_t participant_index;
     uint8_t response[32];
+    uint8_t public_key[64]; // Public key of the participant
 } __packed serialized_signature_share_t;
 
 // Flash storage structure
@@ -459,7 +460,7 @@ static int send_nonce_commitment(void) {
     return ret;
 }
 
-// Send signature share to coordinator
+// Updated function to send signature share with public key
 static int send_signature_share(void) {
     if (!signature_share_computed) {
         LOG_ERR("No signature share computed yet");
@@ -470,9 +471,12 @@ static int send_signature_share(void) {
         .participant_index = keypair.public_keys.index
     };
     memcpy(serialized.response, computed_signature_share.response, 32);
+    // Include public key in the response
+    memcpy(serialized.public_key, keypair.public_keys.public_key, 64);
 
-    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR ***");
+    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR WITH PUBLIC KEY ***");
     log_hex("Signature Share", serialized.response, 32);
+    log_hex("Public Key", serialized.public_key, 32);
 
     int ret = send_message(MSG_TYPE_SIGNATURE_SHARE, 
                           keypair.public_keys.index,
