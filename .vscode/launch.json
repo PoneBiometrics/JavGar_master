@@ -3,7 +3,7 @@
     "configurations": [
         {
             "cwd": "${workspaceFolder}",
-            "executable": "./signing/build/nucleo_l476rg/zephyr/zephyr.elf",
+            "executable": "./hid/build/offpad/zephyr/zephyr.elf",
             "name": "Cortex Debug",
             "request": "launch",
             "type": "cortex-debug",

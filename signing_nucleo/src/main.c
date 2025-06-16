@@ -2,26 +2,27 @@
 #include <assert.h>
 #include <string.h>
 #include <stdint.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/ring_buffer.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
 #include <secp256k1.h>
 #include <secp256k1_frost.h>
 #include "examples_util.h"
 
-LOG_MODULE_REGISTER(frost_device, LOG_LEVEL_INF);
-
 #define T 2
 #define UART_DEVICE_NODE DT_NODELABEL(usart1) 
 #define STORAGE_PARTITION storage_partition
 
-// Communication and receive state
+LOG_MODULE_REGISTER(frost_uart_device, LOG_LEVEL_INF);
+
+// Buffer sizes
 #define RING_BUF_SIZE 512
-#define MAX_MSG_SIZE 256
+#define MAX_MSG_SIZE 300
+#define RECEIVE_TIMEOUT_MS 30000
 
 static uint8_t rx_buf[RING_BUF_SIZE];
 static struct ring_buf rx_ring_buf;
@@ -49,20 +50,27 @@ typedef struct {
     uint32_t participant;  
 } __packed message_header_t;
 
-// Nonce commitment structure for transmission
+// Nonce commitment structure
 typedef struct {
-    uint32_t participant_index;
-    uint8_t hiding[32];     
-    uint8_t binding[32];    
+    uint32_t index;
+    uint8_t hiding[64];
+    uint8_t binding[64];
 } __packed serialized_nonce_commitment_t;
 
-// Updated signature share structure with public key AND group public key
+// Signature share structure
 typedef struct {
-    uint32_t participant_index;
+    uint32_t index;
     uint8_t response[32];
-    uint8_t public_key[64]; // Public key of the participant
-    uint8_t group_public_key[64]; // Group public key for aggregation
 } __packed serialized_signature_share_t;
+
+// Keypair structure for transmission
+typedef struct {
+    uint32_t index;
+    uint32_t max_participants;
+    uint8_t secret[32];
+    uint8_t public_key[64];
+    uint8_t group_public_key[64];
+} __packed serialized_keypair_t;
 
 // Flash storage structure
 typedef struct {
@@ -70,7 +78,7 @@ typedef struct {
     uint32_t keypair_max_participants;
     uint8_t keypair_secret[32];
     uint8_t keypair_public_key[64];
-    uint8_t keypair_group_public_key[64]; // Changed from 33 to 64 bytes
+    uint8_t keypair_group_public_key[64];
 } __packed frost_flash_storage_t;
 
 // Global FROST objects
@@ -138,7 +146,7 @@ int load_frost_key_material(void) {
 
 // Helper function to log hex data
 static void log_hex(const char *label, const uint8_t *data, size_t len) {
-    char hexstr[129]; // Enough for 64 bytes
+    char hexstr[129];
     size_t print_len = (len > 64) ? 64 : len;
     
     for (size_t i = 0; i < print_len; i++) {
@@ -157,7 +165,7 @@ static void log_hex(const char *label, const uint8_t *data, size_t len) {
 static int uart_send_data(const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         uart_poll_out(uart_dev, data[i]);
-        k_usleep(100); // Small delay for stability
+        k_usleep(100);
     }
     return 0;
 }
@@ -195,7 +203,7 @@ static bool send_message(uint8_t msg_type, uint32_t participant,
     return true;
 }
 
-// Function to generate nonce at startup
+// Generate nonce at startup
 static void generate_nonce(void) {
     if (!keypair_loaded) {
         LOG_ERR("Keypair not loaded");
@@ -205,7 +213,6 @@ static void generate_nonce(void) {
     unsigned char binding_seed[32] = {0};
     unsigned char hiding_seed[32] = {0};
 
-    // Generate randomness for nonce creation
     if (!fill_random(binding_seed, sizeof(binding_seed))) {
         LOG_ERR("Failed to generate binding_seed");
         return;
@@ -217,7 +224,6 @@ static void generate_nonce(void) {
 
     LOG_INF("Generating nonce at startup for participant %u", keypair.public_keys.index);
 
-    // Create nonce and store for later use
     if (current_nonce != NULL) {
         secp256k1_frost_nonce_destroy(current_nonce);
     }
@@ -227,37 +233,56 @@ static void generate_nonce(void) {
         return;
     }
 
-    // Log the generated commitments
     log_hex("Nonce hiding commitment", current_nonce->commitments.hiding, 32);
     log_hex("Nonce binding commitment", current_nonce->commitments.binding, 32);
 }
 
-// Function to send nonce commitment
-static bool send_nonce_commitment(void) {
+// Generate and send nonce commitment AND keypair
+static bool send_nonce_commitment_and_keypair(void) {
     if (!current_nonce) {
-        LOG_ERR("No nonce available");
+        LOG_ERR("No nonce available to send commitment");
+        return false;
+    }
+    
+    // Prepare combined payload
+    size_t payload_len = sizeof(serialized_nonce_commitment_t) + sizeof(serialized_keypair_t);
+    uint8_t* combined_payload = k_malloc(payload_len);
+    if (!combined_payload) {
+        LOG_ERR("Failed to allocate memory for combined payload");
         return false;
     }
 
-    serialized_nonce_commitment_t serialized;
-    serialized.participant_index = keypair.public_keys.index;
-    memcpy(serialized.hiding, current_nonce->commitments.hiding, 32);
-    memcpy(serialized.binding, current_nonce->commitments.binding, 32);
+    // Nonce commitment
+    serialized_nonce_commitment_t* nonce_part = (serialized_nonce_commitment_t*)combined_payload;
+    nonce_part->index = keypair.public_keys.index;
+    memcpy(nonce_part->hiding, current_nonce->commitments.hiding, 64);
+    memcpy(nonce_part->binding, current_nonce->commitments.binding, 64);
 
+    // Keypair
+    serialized_keypair_t* keypair_part = (serialized_keypair_t*)(combined_payload + sizeof(serialized_nonce_commitment_t));
+    keypair_part->index = keypair.public_keys.index;
+    keypair_part->max_participants = keypair.public_keys.max_participants;
+    memcpy(keypair_part->secret, keypair.secret, 32);
+    memcpy(keypair_part->public_key, keypair.public_keys.public_key, 64);
+    memcpy(keypair_part->group_public_key, keypair.public_keys.group_public_key, 64);
+
+    LOG_INF("Sending nonce commitment and keypair for participant %u", keypair.public_keys.index);
+    
     bool result = send_message(MSG_TYPE_NONCE_COMMITMENT, 
                               keypair.public_keys.index,
-                              &serialized, sizeof(serialized));
+                              combined_payload, payload_len);
+    
+    k_free(combined_payload);
     
     if (result) {
-        LOG_INF("Nonce commitment sent successfully");
-        // Send end transmission marker
+        LOG_INF("Nonce commitment and keypair sent successfully");
         send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
     }
     
     return result;
 }
 
-// Updated function to send signature share with public key AND group public key
+// Function to send signature share
 static bool send_signature_share(void) {
     if (!signature_share_computed) {
         LOG_ERR("No signature share computed yet");
@@ -265,16 +290,11 @@ static bool send_signature_share(void) {
     }
 
     serialized_signature_share_t serialized;
-    serialized.participant_index = keypair.public_keys.index;
+    serialized.index = keypair.public_keys.index;
     memcpy(serialized.response, computed_signature_share.response, 32);
-    // Include public key and group public key in the response
-    memcpy(serialized.public_key, keypair.public_keys.public_key, 64);
-    memcpy(serialized.group_public_key, keypair.public_keys.group_public_key, 64);
 
-    LOG_INF("*** SENDING SIGNATURE SHARE WITH PUBLIC KEY AND GROUP PUBLIC KEY ***");
+    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR ***");
     log_hex("Signature Share", serialized.response, 32);
-    log_hex("Public Key", serialized.public_key, 32);
-    log_hex("Group Public Key", serialized.group_public_key, 32);
 
     bool result = send_message(MSG_TYPE_SIGNATURE_SHARE, 
                               keypair.public_keys.index,
@@ -282,19 +302,12 @@ static bool send_signature_share(void) {
     
     if (result) {
         LOG_INF("Signature share sent successfully to coordinator");
-        // Send end transmission marker
         send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
     } else {
         LOG_ERR("Failed to send signature share");
     }
     
     return result;
-}
-
-// Process READY message
-static void process_ready_message() {
-    LOG_INF("*** Received READY signal ***");
-    send_nonce_commitment();
 }
 
 // Process signing request and compute signature share
@@ -304,7 +317,7 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
         return;
     }
     
-    // Parse payload: [msghash (32 bytes)][num_commitments (4 bytes)][commitments...]
+    // Parse payload
     uint8_t* msg_hash = (uint8_t*)payload;
     uint32_t num_commitments = *(uint32_t*)(payload + 32);
     serialized_nonce_commitment_t* serialized_commitments = (serialized_nonce_commitment_t*)(payload + 32 + 4);
@@ -315,7 +328,6 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
             msg_hash[4], msg_hash[5], msg_hash[6], msg_hash[7]);
     LOG_INF("Number of commitments: %u", num_commitments);
     
-    // Check if we have a nonce for this participant
     if (!current_nonce) {
         LOG_ERR("No nonce available for signing");
         return;
@@ -326,7 +338,7 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
         return;
     }
     
-    // Convert serialized commitments to secp256k1_frost_nonce_commitment array
+    // Convert serialized commitments
     secp256k1_frost_nonce_commitment *signing_commitments = 
         k_malloc(num_commitments * sizeof(secp256k1_frost_nonce_commitment));
     if (!signing_commitments) {
@@ -335,9 +347,9 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
     }
     
     for (uint32_t i = 0; i < num_commitments; i++) {
-        signing_commitments[i].index = serialized_commitments[i].participant_index;
-        memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 32);
-        memcpy(signing_commitments[i].binding, serialized_commitments[i].binding, 32);
+        signing_commitments[i].index = serialized_commitments[i].index;
+        memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 64);
+        memcpy(signing_commitments[i].binding, serialized_commitments[i].binding, 64);
     }
     
     // Compute signature share
@@ -351,7 +363,7 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
         LOG_INF("*** SIGNATURE SHARE COMPUTED SUCCESSFULLY ***");
         log_hex("SIGNATURE SHARE (32 bytes)", computed_signature_share.response, 32);
         
-        // Print signature share in hex format
+        // Print signature share
         char hex_str[65];
         for (int i = 0; i < 32; i++) {
             sprintf(hex_str + i * 2, "%02x", computed_signature_share.response[i]);
@@ -362,19 +374,14 @@ static void process_sign_message(const message_header_t *header, const uint8_t *
         printk("Signature: %s\n", hex_str);
         printk("=============================\n\n");
         
-        // Wait a moment then send the signature share to the coordinator
-        k_msleep(1000);
-        LOG_INF("Sending signature share to coordinator...");
-        if (!send_signature_share()) {
-            LOG_ERR("Failed to send signature share to coordinator");
-        }
+        // Enviar share inmediatamente
+        send_signature_share();
         
     } else {
         LOG_ERR("Failed to compute signature share");
         signature_share_computed = false;
     }
     
-    // Clean up
     k_free(signing_commitments);
 }
 
@@ -385,10 +392,18 @@ static void uart_cb(const struct device *dev, void *user_data) {
     while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
         if (uart_irq_rx_ready(dev)) {
             while (uart_fifo_read(dev, &byte, 1) == 1) {
-                ring_buf_put(&rx_ring_buf, &byte, 1);
+                if (ring_buf_put(&rx_ring_buf, &byte, 1) == 0) {
+                    LOG_WRN("Ring buffer full, dropping byte");
+                }
             }
         }
     }
+}
+
+// Procesar mensaje READY
+static void process_ready_message() {
+    LOG_INF("*** Received READY signal ***");
+    send_nonce_commitment_and_keypair();
 }
 
 // Main application
@@ -405,11 +420,26 @@ int main(void) {
         return -1;
     }
     
-    // Configure UART
+    // Configure UART with detailed settings
+    struct uart_config uart_cfg = {
+        .baudrate = 115200,
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+    };
+    
+    int uart_cfg_ret = uart_configure(uart_dev, &uart_cfg);
+    if (uart_cfg_ret != 0) {
+        LOG_ERR("Failed to configure UART: %d", uart_cfg_ret);
+        return -1;
+    }
+    
     uart_irq_callback_set(uart_dev, uart_cb);
     uart_irq_rx_enable(uart_dev);
-    LOG_INF("UART device configured");
     
+    LOG_INF("UART device configured at 115200 baud");
+
     // Initialize secp256k1 context
     ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (ctx == NULL) {
@@ -430,89 +460,90 @@ int main(void) {
     generate_nonce();
     
     LOG_INF("=== Ready to receive messages ===");
+    LOG_INF("Participant %u ready for FROST protocol", keypair.public_keys.index);
     
-    uint8_t temp_buf[64];
-    size_t bytes_read;
+    // Flush UART buffers
+    uint8_t dummy;
+    while (uart_fifo_read(uart_dev, &dummy, 1) == 1) {
+        // Discard any existing data
+    }
     
     // Main processing loop
     while (1) {
-        // Process received data
-        if (rx_state == WAITING_FOR_HEADER) {
-            // Try to read complete header
-            bytes_read = ring_buf_peek(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-            
-            if (bytes_read == sizeof(message_header_t)) {
-                memcpy(&current_header, temp_buf, sizeof(message_header_t));
+        size_t bytes_available = ring_buf_size_get(&rx_ring_buf);
+        
+        if (bytes_available > 0) {
+            if (rx_state == WAITING_FOR_HEADER && bytes_available >= sizeof(message_header_t)) {
+                // Read complete header
+                size_t read = ring_buf_get(&rx_ring_buf, (uint8_t*)&current_header, sizeof(message_header_t));
+                if (read != sizeof(message_header_t)) {
+                    LOG_ERR("Failed to read full header");
+                    continue;
+                }
                 
                 // Validate header
                 if (current_header.magic != MSG_HEADER_MAGIC) {
                     LOG_ERR("Invalid magic number: 0x%08x", current_header.magic);
-                    ring_buf_get(&rx_ring_buf, temp_buf, 1); // Discard one byte
+                    LOG_HEXDUMP_ERR((uint8_t*)&current_header, sizeof(message_header_t), "Invalid header:");
                     continue;
                 }
                 
                 if (current_header.version != MSG_VERSION) {
                     LOG_ERR("Unsupported version: %d", current_header.version);
-                    ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
                     continue;
                 }
                 
                 if (current_header.payload_len > MAX_MSG_SIZE) {
                     LOG_ERR("Payload too large: %d", current_header.payload_len);
-                    ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
                     continue;
                 }
                 
-                // Header is valid, consume it
-                ring_buf_get(&rx_ring_buf, temp_buf, sizeof(message_header_t));
-                
-                LOG_DBG("Valid header received: type=0x%02x, len=%u", 
+                LOG_INF("Received valid header: type=0x%02x, len=%u", 
                         current_header.msg_type, current_header.payload_len);
                 
                 if (current_header.payload_len == 0) {
-                    // Process message without payload immediately
+                    // Process message without payload
                     if (current_header.msg_type == MSG_TYPE_READY) {
                         process_ready_message();
                     }
-                    rx_state = WAITING_FOR_HEADER;
                 } else {
-                    // Wait for payload
                     rx_state = WAITING_FOR_PAYLOAD;
                     payload_bytes_received = 0;
                 }
             }
-        }
-        
-        if (rx_state == WAITING_FOR_PAYLOAD) {
-            // Try to read remaining payload
-            uint16_t remaining = current_header.payload_len - payload_bytes_received;
-            bytes_read = ring_buf_get(&rx_ring_buf, 
-                                     payload_buffer + payload_bytes_received, 
-                                     remaining);
             
-            payload_bytes_received += bytes_read;
-            
-            if (payload_bytes_received == current_header.payload_len) {
-                // Complete payload received, process message
-                LOG_DBG("Complete payload received (%u bytes)", payload_bytes_received);
+            if (rx_state == WAITING_FOR_PAYLOAD) {
+                size_t bytes_to_read = MIN(
+                    current_header.payload_len - payload_bytes_received,
+                    bytes_available
+                );
                 
-                if (current_header.msg_type == MSG_TYPE_SIGN) {
-                    process_sign_message(&current_header, payload_buffer);
+                if (bytes_to_read > 0) {
+                    size_t read = ring_buf_get(
+                        &rx_ring_buf, 
+                        payload_buffer + payload_bytes_received, 
+                        bytes_to_read
+                    );
+                    
+                    payload_bytes_received += read;
+                    LOG_DBG("Read %zu payload bytes (%zu/%u)", 
+                            read, payload_bytes_received, current_header.payload_len);
+                    
+                    if (payload_bytes_received == current_header.payload_len) {
+                        LOG_INF("Complete payload received");
+                        
+                        if (current_header.msg_type == MSG_TYPE_SIGN) {
+                            process_sign_message(&current_header, payload_buffer);
+                        }
+                        
+                        rx_state = WAITING_FOR_HEADER;
+                    }
                 }
-                
-                rx_state = WAITING_FOR_HEADER;
             }
         }
         
-        // Small delay to prevent busy waiting
         k_msleep(10);
     }
-    
-    // Cleanup (never reached in normal operation)
-    if (current_nonce) {
-        secp256k1_frost_nonce_destroy(current_nonce);
-    }
-    secp256k1_context_destroy(ctx);
     
     return 0;
 }

@@ -1,9 +1,0 @@
-[submodule "external/modules/crypto/secp256k1-frost"]
-	path = external/modules/crypto/secp256k1-frost
-	url = https://github.com/bancaditalia/secp256k1-frost.git
-[submodule "signing/secp256k1-frost"]
-	path = signing/secp256k1-frost
-	url = https://github.com/bancaditalia/secp256k1-frost
-[submodule "signing/modules/crypto/secp256k1-frost"]
-	path = signing/modules/crypto/secp256k1-frost
-	url = https://github.com/bancaditalia/secp256k1-frost

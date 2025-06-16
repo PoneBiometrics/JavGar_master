@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(receive_usb_copy)
+project(receive_usb_nucleo)
 
 file(GLOB_RECURSE SECP256K1_SOURCES
   modules/secp256k1/src/*.c

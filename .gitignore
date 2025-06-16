@@ -1,8 +1,4 @@
 .venv/
 external
-/receive_bluetooth
-/hello_world
-/dts
 **/build*/
 .vscode/compile_commands.json
-zephyr-sdk-0.17.0/

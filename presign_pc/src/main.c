@@ -2,21 +2,22 @@
 #include <assert.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <secp256k1.h>
 #include <secp256k1_frost.h>
 #include <windows.h>
-// For USB HID communication
 #include <setupapi.h>
 #include <hidsdi.h>
+
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 
 #define N 3 // Number of participants
 #define T 2 // Threshold of needed participants
 
-// USB HID constants - MUST match receiver
-#define VENDOR_ID 0x2FE3   // Nordic Semiconductor
-#define PRODUCT_ID 0x100   // Adjust based on your device
+// USB HID constants
+#define VENDOR_ID 0x2FE3   
+#define PRODUCT_ID 0x100   
 
 // Communication types
 typedef enum {
@@ -37,15 +38,6 @@ typedef struct {
         };
     };
 } comm_handle_t;
-
-// Helper function to print hex data
-void print_hex(const char *label, const unsigned char *data, size_t len) {
-    printf("%s: ", label);
-    for (size_t i = 0; i < len; i++) {
-        printf("%02x", data[i]);
-    }
-    printf("\n");
-}
 
 // Constants for message protocol - MUST match receiver
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
@@ -70,104 +62,35 @@ typedef struct {
 } message_header_t;
 #pragma pack(pop)
 
-// Function to enumerate and display HID devices
-void enumerate_hid_devices() {
-    GUID hid_guid;
-    HDEVINFO device_info_set;
-    SP_DEVICE_INTERFACE_DATA device_interface_data;
-    PSP_DEVICE_INTERFACE_DETAIL_DATA device_interface_detail_data;
-    DWORD required_size;
-    int device_count = 0;
+// Corrected structures to match the example format
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t receiver_index;
+    uint8_t value[32];
+} serialized_share_t;
+#pragma pack(pop)
 
-    printf("\n=== Enumerating all HID devices ===\n");
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t index;
+    uint32_t max_participants;
+    uint8_t public_key[64];      // 64 bytes like in example
+    uint8_t group_public_key[64]; // 64 bytes like in example
+} serialized_pubkey_t;
+#pragma pack(pop)
 
-    // Get HID GUID
-    HidD_GetHidGuid(&hid_guid);
-
-    // Get device information set
-    device_info_set = SetupDiGetClassDevs(&hid_guid, NULL, NULL, 
-                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (device_info_set == INVALID_HANDLE_VALUE) {
-        printf("Failed to get device information set\n");
-        return;
+// Helper function to print hex data
+void print_hex(const char *label, const unsigned char *data, size_t len) {
+    printf("%s: ", label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", data[i]);
     }
-
-    device_interface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-
-    // Enumerate devices
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(device_info_set, NULL, &hid_guid, 
-                                                  i, &device_interface_data); i++) {
-        // Get required buffer size
-        SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data, 
-                                       NULL, 0, &required_size, NULL);
-
-        // Allocate buffer
-        device_interface_detail_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(required_size);
-        if (!device_interface_detail_data) continue;
-        device_interface_detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-
-        // Get device path
-        if (SetupDiGetDeviceInterfaceDetail(device_info_set, &device_interface_data,
-                                           device_interface_detail_data, required_size,
-                                           NULL, NULL)) {
-            // Try to open device
-            HANDLE temp_handle = CreateFile(device_interface_detail_data->DevicePath,
-                                          GENERIC_READ | GENERIC_WRITE,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                          NULL, OPEN_EXISTING, 0, NULL);
-            if (temp_handle != INVALID_HANDLE_VALUE) {
-                // Get device attributes
-                HIDD_ATTRIBUTES attributes;
-                attributes.Size = sizeof(HIDD_ATTRIBUTES);
-                if (HidD_GetAttributes(temp_handle, &attributes)) {
-                    printf("Device %d:\n", ++device_count);
-                    printf("  Path: %s\n", device_interface_detail_data->DevicePath);
-                    printf("  Vendor ID: 0x%04X\n", attributes.VendorID);
-                    printf("  Product ID: 0x%04X\n", attributes.ProductID);
-                    printf("  Version: 0x%04X\n", attributes.VersionNumber);
-
-                    // Try to get product string
-                    wchar_t product_string[256];
-                    if (HidD_GetProductString(temp_handle, product_string, sizeof(product_string))) {
-                        printf("  Product: %ls\n", product_string);
-                    }
-
-                    // Try to get manufacturer string
-                    wchar_t manufacturer_string[256];
-                    if (HidD_GetManufacturerString(temp_handle, manufacturer_string, sizeof(manufacturer_string))) {
-                        printf("  Manufacturer: %ls\n", manufacturer_string);
-                    }
-
-                    // Get capabilities
-                    PHIDP_PREPARSED_DATA preparsed_data;
-                    if (HidD_GetPreparsedData(temp_handle, &preparsed_data)) {
-                        HIDP_CAPS capabilities;
-                        if (HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS) {
-                            printf("  Usage Page: 0x%04X\n", capabilities.UsagePage);
-                            printf("  Usage: 0x%04X\n", capabilities.Usage);
-                            printf("  Input Report Length: %d\n", capabilities.InputReportByteLength);
-                            printf("  Output Report Length: %d\n", capabilities.OutputReportByteLength);
-                        }
-                        HidD_FreePreparsedData(preparsed_data);
-                    }
-                    printf("\n");
-                }
-                CloseHandle(temp_handle);
-            }
-        }
-        free(device_interface_detail_data);
-    }
-
-    SetupDiDestroyDeviceInfoList(device_info_set);
-    if (device_count == 0) {
-        printf("No HID devices found.\n");
-    } else {
-        printf("Total HID devices found: %d\n", device_count);
-    }
-    printf("================================\n\n");
+    printf("\n");
 }
 
-// Enhanced USB HID helper functions with better error handling
+// fill_random is provided by examples_util.h - no need to implement
+
+// Enhanced USB HID helper functions
 comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
     comm_handle_t comm = {0};
     GUID hid_guid;
@@ -179,7 +102,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
     printf("Looking for HID device with VID:0x%04X PID:0x%04X\n", vendor_id, product_id);
 
     HidD_GetHidGuid(&hid_guid);
-
     device_info_set = SetupDiGetClassDevs(&hid_guid, NULL, NULL, 
                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (device_info_set == INVALID_HANDLE_VALUE) {
@@ -202,7 +124,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                                            device_interface_detail_data, required_size,
                                            NULL, NULL)) {
             
-            // Try different access modes
             DWORD access_modes[] = {
                 GENERIC_WRITE,
                 GENERIC_READ | GENERIC_WRITE,
@@ -215,18 +136,14 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                 temp_handle = CreateFile(device_interface_detail_data->DevicePath,
                                        access_modes[mode_idx],
                                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       NULL, OPEN_EXISTING, 
-                                       0,  // Try without FILE_FLAG_OVERLAPPED first
-                                       NULL);
+                                       NULL, OPEN_EXISTING, 0, NULL);
                 
                 if (temp_handle == INVALID_HANDLE_VALUE) {
-                    // Try with overlapped I/O
                     temp_handle = CreateFile(device_interface_detail_data->DevicePath,
                                            access_modes[mode_idx],
                                            FILE_SHARE_READ | FILE_SHARE_WRITE,
                                            NULL, OPEN_EXISTING, 
-                                           FILE_FLAG_OVERLAPPED,
-                                           NULL);
+                                           FILE_FLAG_OVERLAPPED, NULL);
                 }
             }
             
@@ -234,9 +151,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                 HIDD_ATTRIBUTES attributes;
                 attributes.Size = sizeof(HIDD_ATTRIBUTES);
                 if (HidD_GetAttributes(temp_handle, &attributes)) {
-                    printf("Checking device: VID:0x%04X PID:0x%04X\n", 
-                           attributes.VendorID, attributes.ProductID);
-                    
                     if (attributes.VendorID == vendor_id && attributes.ProductID == product_id) {
                         printf("Found matching device!\n");
                         
@@ -244,11 +158,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                         if (HidD_GetPreparsedData(temp_handle, &preparsed_data)) {
                             HIDP_CAPS capabilities;
                             if (HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS) {
-                                printf("Device capabilities:\n");
-                                printf("  Usage Page: 0x%04X\n", capabilities.UsagePage);
-                                printf("  Usage: 0x%04X\n", capabilities.Usage);
-                                printf("  Output Report Length: %d\n", capabilities.OutputReportByteLength);
-                                
                                 comm.type = COMM_TYPE_USB_HID;
                                 comm.hid_handle = temp_handle;
                                 comm.preparsed_data = preparsed_data;
@@ -264,9 +173,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                     }
                 }
                 CloseHandle(temp_handle);
-            } else {
-                printf("Failed to open device: %s. Error: %lu\n", 
-                       device_interface_detail_data->DevicePath, GetLastError());
             }
         }
         free(device_interface_detail_data);
@@ -277,7 +183,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
     return comm;
 }
 
-// Fixed HID data sending function using HidD_SetOutputReport
 BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
     const uint8_t* data_ptr = (const uint8_t*)data;
     size_t bytes_sent = 0;
@@ -285,36 +190,24 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
     printf("Sending %zu bytes via HID (Report Length: %d)\n", len, comm->output_report_length);
     
     while (bytes_sent < len) {
-        // Allocate full report buffer (required by many HID devices)
         uint8_t* report = (uint8_t*)calloc(1, comm->output_report_length);
         if (!report) {
             printf("Failed to allocate report buffer\n");
             return FALSE;
         }
         
-        // Set report ID
         report[0] = 0x02;
-        
-        // Calculate chunk size - leave room for report ID and length byte
-        size_t available_space = comm->output_report_length - 2; // -1 for report ID, -1 for length
+        size_t available_space = comm->output_report_length - 2;
         size_t remaining = len - bytes_sent;
         size_t chunk_size = (available_space < remaining) ? available_space : remaining;
         
-        // Set the actual data length in the second byte
         report[1] = (uint8_t)chunk_size;
-        
-        // Copy data to report buffer starting at byte 2
         memcpy(report + 2, data_ptr + bytes_sent, chunk_size);
         
-        printf("Sending chunk %zu bytes (sent: %zu/%zu), full report: %d bytes\n", 
-               chunk_size, bytes_sent, len, comm->output_report_length);
-        
-        // Send the full report
         if (!HidD_SetOutputReport(comm->hid_handle, report, comm->output_report_length)) {
             DWORD error = GetLastError();
             printf("Failed to send HID report. Error: %lu\n", error);
             
-            // Try alternative method if first fails
             DWORD bytes_written;
             OVERLAPPED overlapped = {0};
             overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -324,10 +217,8 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
                                             &bytes_written, &overlapped);
                 if (!write_result) {
                     if (GetLastError() == ERROR_IO_PENDING) {
-                        // Wait for completion
                         if (WaitForSingleObject(overlapped.hEvent, 5000) == WAIT_OBJECT_0) {
                             if (GetOverlappedResult(comm->hid_handle, &overlapped, &bytes_written, FALSE)) {
-                                printf("Alternative send method succeeded\n");
                                 write_result = TRUE;
                             }
                         }
@@ -336,7 +227,6 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
                 CloseHandle(overlapped.hEvent);
                 
                 if (!write_result) {
-                    printf("Both send methods failed\n");
                     free(report);
                     return FALSE;
                 }
@@ -348,16 +238,12 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
         
         free(report);
         bytes_sent += chunk_size;
-        
-        // Delay between chunks to prevent overwhelming the receiver
         Sleep(100);
     }
     
-    printf("Successfully sent all %zu bytes\n", bytes_sent);
     return TRUE;
 }
 
-// Generic communication functions
 BOOL send_data(comm_handle_t* comm, const void* data, size_t len) {
     switch (comm->type) {
         case COMM_TYPE_UART: {
@@ -372,7 +258,6 @@ BOOL send_data(comm_handle_t* comm, const void* data, size_t len) {
     }
 }
 
-// Function to send a message with header and payload
 BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant, 
                   const void* payload, uint16_t payload_len) {
     message_header_t header;
@@ -387,19 +272,8 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
            msg_type, participant, payload_len);
     
     size_t total_size = sizeof(header) + payload_len;
-    
-    // Check if message fits in HID report
-    if (comm->type == COMM_TYPE_USB_HID) {
-        size_t max_data_per_report = comm->output_report_length - 1; // -1 for report ID
-        if (total_size > max_data_per_report) {
-            printf("Message size %zu exceeds single report capacity %zu, will be chunked\n", 
-                   total_size, max_data_per_report);
-        }
-    }
-    
     uint8_t* combined_buffer = (uint8_t*)malloc(total_size);
     if (!combined_buffer) {
-        printf("Failed to allocate combined buffer\n");
         return FALSE;
     }
     
@@ -413,26 +287,14 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
     
     if (result) {
         printf("Message sent successfully\n");
-        // Add delay after each message
         Sleep(1000);
-    } else {
-        printf("Failed to send message\n");
     }
     
     return result;
 }
 
-// Function to send a secret share to a participant
 BOOL send_secret_share(comm_handle_t* comm, uint32_t participant, 
                        const secp256k1_frost_keygen_secret_share *share) {
-    // Structure to hold just the serialized data from the secret share
-    #pragma pack(push, 1)
-    typedef struct {
-        uint32_t receiver_index;
-        uint8_t value[32];
-    } serialized_share_t;
-    #pragma pack(pop)
-    
     serialized_share_t serialized;
     serialized.receiver_index = share->receiver_index;
     memcpy(serialized.value, share->value, sizeof(serialized.value));
@@ -441,19 +303,8 @@ BOOL send_secret_share(comm_handle_t* comm, uint32_t participant,
                        &serialized, sizeof(serialized));
 }
 
-// Function to send public key data to a participant
 BOOL send_public_key(comm_handle_t* comm, uint32_t participant, 
                     const secp256k1_frost_pubkey *pubkey) {
-    // Structure to hold just the serialized data from the public key
-    #pragma pack(push, 1)
-    typedef struct {
-        uint32_t index;
-        uint32_t max_participants;
-        uint8_t public_key[64];
-        uint8_t group_public_key[33];
-    } serialized_pubkey_t;
-    #pragma pack(pop)
-    
     serialized_pubkey_t serialized;
     serialized.index = pubkey->index;
     serialized.max_participants = pubkey->max_participants;
@@ -464,53 +315,41 @@ BOOL send_public_key(comm_handle_t* comm, uint32_t participant,
                        &serialized, sizeof(serialized));
 }
 
-// Function to send commitment data to a participant
 BOOL send_commitments(comm_handle_t* comm, uint32_t participant, 
                      const secp256k1_frost_vss_commitments *commitments) {
-    // Calculate size needed for the serialized data
     size_t coef_data_size = commitments->num_coefficients * sizeof(secp256k1_frost_vss_commitment);
     size_t total_size = sizeof(uint32_t) * 2 + sizeof(uint8_t) * 32 + sizeof(uint8_t) * 64 + coef_data_size;
     
-    // Allocate buffer for serialized data
     uint8_t* buffer = (uint8_t*)malloc(total_size);
     if (!buffer) {
-        printf("Memory allocation failed\n");
         return FALSE;
     }
     
-    // Fill the buffer with serialized data
     uint8_t *ptr = buffer;
     
-    // index and num_coefficients
     memcpy(ptr, &commitments->index, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
     memcpy(ptr, &commitments->num_coefficients, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
     
-    // zkp_z and zkp_r
     memcpy(ptr, commitments->zkp_z, 32);
     ptr += 32;
     memcpy(ptr, commitments->zkp_r, 64);
     ptr += 64;
     
-    // coefficient_commitments
     memcpy(ptr, commitments->coefficient_commitments, coef_data_size);
     
-    // Send the message
     BOOL result = send_message(comm, MSG_TYPE_COMMITMENTS, participant,
                               buffer, (uint16_t)total_size);
     
-    // Free buffer
     free(buffer);
     return result;
 }
 
-// Function to signal end of transmission
 BOOL send_end_transmission(comm_handle_t* comm, uint32_t participant) {
     return send_message(comm, MSG_TYPE_END_TRANSMISSION, participant, NULL, 0);
 }
 
-// Function to open and configure the UART port
 HANDLE setup_uart_port(const char *port_name) {
     HANDLE hSerial = CreateFile(port_name,
         GENERIC_WRITE,
@@ -520,16 +359,13 @@ HANDLE setup_uart_port(const char *port_name) {
         FILE_ATTRIBUTE_NORMAL,
         NULL);
     if (hSerial == INVALID_HANDLE_VALUE) {
-        printf("Failed to open COM port %s. Error: %lu\n", port_name, GetLastError());
         return INVALID_HANDLE_VALUE;
     }
 
-    // Configure serial port settings
     DCB dcbSerialParams = {0};
     dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
     
     if (!GetCommState(hSerial, &dcbSerialParams)) {
-        printf("Error getting port state\n");
         CloseHandle(hSerial);
         return INVALID_HANDLE_VALUE;
     }
@@ -538,12 +374,10 @@ HANDLE setup_uart_port(const char *port_name) {
     dcbSerialParams.StopBits = ONESTOPBIT;
     dcbSerialParams.Parity = NOPARITY;
     if (!SetCommState(hSerial, &dcbSerialParams)) {
-        printf("Error setting port state\n");
         CloseHandle(hSerial);
         return INVALID_HANDLE_VALUE;
     }
 
-    // Set timeouts
     COMMTIMEOUTS timeouts = {0};
     timeouts.ReadIntervalTimeout = 50;
     timeouts.ReadTotalTimeoutConstant = 50;
@@ -551,33 +385,30 @@ HANDLE setup_uart_port(const char *port_name) {
     timeouts.WriteTotalTimeoutConstant = 50;
     timeouts.WriteTotalTimeoutMultiplier = 10;
     if (!SetCommTimeouts(hSerial, &timeouts)) {
-        printf("Error setting timeouts\n");
         CloseHandle(hSerial);
         return INVALID_HANDLE_VALUE;
     }
     return hSerial;
 }
 
-// Function to setup communication based on user choice
 comm_handle_t setup_communication(int participant_id) {
     comm_handle_t comm = {0};
     
     printf("\nSelect communication method for participant %d:\n", participant_id);
     printf("1. UART/Serial (COM port)\n");
     printf("2. USB HID\n");
-    printf("3. List all HID devices\n");
-    printf("Enter choice (1, 2, or 3): ");
+    printf("Enter choice (1 or 2): ");
     
     int choice;
     scanf("%d", &choice);
-    getchar(); // Consume newline
+    getchar();
     
     switch (choice) {
         case 1: {
             printf("Enter COM port (e.g., COM4): ");
             char port_name[10];
             scanf("%s", port_name);
-            getchar(); // Consume newline
+            getchar();
             
             HANDLE uart_handle = setup_uart_port(port_name);
             if (uart_handle != INVALID_HANDLE_VALUE) {
@@ -588,36 +419,11 @@ comm_handle_t setup_communication(int participant_id) {
             break;
         }
         case 2: {
-            printf("Current settings: VID=0x%04X, PID=0x%04X\n", VENDOR_ID, PRODUCT_ID);
-            printf("Do you want to use different VID/PID? (y/n): ");
-            char use_custom;
-            scanf(" %c", &use_custom);
-            getchar();
-            
-            USHORT vid = VENDOR_ID;
-            USHORT pid = PRODUCT_ID;
-            
-            if (use_custom == 'y' || use_custom == 'Y') {
-                printf("Enter Vendor ID (hex, e.g., 2FE3): ");
-                scanf("%hx", &vid);
-                printf("Enter Product ID (hex, e.g., 100): ");
-                scanf("%hx", &pid);
-                getchar();
-            }
-            
-            printf("Searching for USB HID device (VID:0x%04X, PID:0x%04X)...\n", vid, pid);
-            comm = find_hid_device(vid, pid);
-            
+            comm = find_hid_device(VENDOR_ID, PRODUCT_ID);
             if (comm.type == COMM_TYPE_USB_HID) {
                 printf("USB HID communication setup successful\n");
-            } else {
-                printf("USB HID device not found.\n");
             }
             break;
-        }
-        case 3: {
-            enumerate_hid_devices();
-            return setup_communication(participant_id); // Recursive call
         }
         default:
             printf("Invalid choice\n");
@@ -647,6 +453,7 @@ int main(void) {
     secp256k1_frost_vss_commitments *dealer_commitments;
     secp256k1_frost_keygen_secret_share shares_by_participant[N];
     secp256k1_frost_keypair keypairs[N];
+    secp256k1_frost_pubkey public_keys[N];
     int return_val;
 
     /* Create context */
@@ -685,6 +492,11 @@ int main(void) {
     }
     printf("Key generation succeeded.\n");
 
+    /* Extract public keys from keypairs */
+    for (int i = 0; i < N; i++) {
+        secp256k1_frost_pubkey_from_keypair(&public_keys[i], &keypairs[i]);
+    }
+
     /* Print keys and shares (for debugging) */
     printf("\n=== Participants ===\n\n");
     for (int i = 0; i < N; i++) {
@@ -692,22 +504,13 @@ int main(void) {
         printf("  Receiver Index: %u\n", shares_by_participant[i].receiver_index);
         print_hex("  Secret Share", shares_by_participant[i].value, 32);
         print_hex("  Public Key", keypairs[i].public_keys.public_key, 64);
-        print_hex("  Group Public Key", keypairs[i].public_keys.group_public_key, 33);
+        print_hex("  Group Public Key", keypairs[i].public_keys.group_public_key, 64);
         printf("\n");
     }
 
     /* Key distribution */
     printf("\n=== Starting Key Distribution ===\n\n");
     
-    // Option to enumerate devices first
-    printf("Do you want to see all available HID devices? (y/n): ");
-    char show_devices;
-    scanf(" %c", &show_devices);
-    getchar();
-    if (show_devices == 'y' || show_devices == 'Y') {
-        enumerate_hid_devices();
-    }
-
     for (int i = 0; i < N; i++) {
         printf("Preparing to send data to participant %d's device...\n", i + 1);
         
@@ -718,52 +521,52 @@ int main(void) {
         }
         printf("Sending data to participant %d...\n", i + 1);
         
-        // Send the secret share
-        printf("Sending secret share...\n");
         if (!send_secret_share(&comm, i + 1, &shares_by_participant[i])) {
             printf("Failed to send secret share to participant %d.\n", i + 1);
             close_communication(&comm);
             continue;
         }
+        printf("Secret share sent successfully. Waiting...\n");
+        Sleep(2000);  // Increased delay
         
-        // Add delay between messages
-        Sleep(500);
-        
-        // Send the public key
-        printf("Sending public key...\n");
-        if (!send_public_key(&comm, i + 1, &keypairs[i].public_keys)) {
+        if (!send_public_key(&comm, i + 1, &public_keys[i])) {
             printf("Failed to send public key to participant %d.\n", i + 1);
             close_communication(&comm);
             continue;
         }
+        printf("Public key sent successfully. Waiting...\n");
+        Sleep(2000);  // Increased delay
         
-        // Add delay between messages
-        Sleep(500);
-        
-        // Send the commitments
-        printf("Sending commitments...\n");
         if (!send_commitments(&comm, i + 1, dealer_commitments)) {
             printf("Failed to send commitments to participant %d.\n", i + 1);
             close_communication(&comm);
             continue;
         }
+        printf("Commitments sent successfully. Waiting before end transmission...\n");
+        Sleep(3000);  // Longer delay before end transmission
         
-        // Add delay between messages
-        Sleep(500);
+        // Try sending end transmission multiple times if it fails
+        int retry_count = 0;
+        bool end_sent = false;
+        while (retry_count < 3 && !end_sent) {
+            printf("Attempting to send end transmission (attempt %d/3)...\n", retry_count + 1);
+            if (send_end_transmission(&comm, i + 1)) {
+                printf("End transmission sent successfully.\n");
+                end_sent = true;
+            } else {
+                printf("End transmission failed (attempt %d/3). Retrying...\n", retry_count + 1);
+                retry_count++;
+                Sleep(1000);  // Wait before retry
+            }
+        }
         
-        // Signal end of transmission
-        printf("Sending end transmission signal...\n");
-        if (!send_end_transmission(&comm, i + 1)) {
-            printf("Failed to send end transmission to participant %d.\n", i + 1);
-            close_communication(&comm);
-            continue;
+        if (!end_sent) {
+            printf("Warning: Could not send end transmission after 3 attempts.\n");
+            printf("Participant %d should still have received all key data.\n", i + 1);
         }
         
         printf("Successfully sent all data to participant %d.\n", i + 1);
         close_communication(&comm);
-        
-        // Add a delay between participants
-        printf("Waiting before next participant...\n");
         Sleep(2000);
     }
     

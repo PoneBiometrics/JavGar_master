@@ -50,7 +50,7 @@ typedef enum {
     MSG_TYPE_READY = 0x06,            
     MSG_TYPE_END_TRANSMISSION = 0xFF,
     MSG_TYPE_SIGN = 0x07,
-    MSG_TYPE_SIGNATURE_SHARE = 0x08   // Para recibir signature shares
+    MSG_TYPE_SIGNATURE_SHARE = 0x08
 } message_type_t;
 
 // Header for each message in our protocol
@@ -64,26 +64,36 @@ typedef struct {
 } message_header_t;
 #pragma pack(pop)
 
-// Nonce commitment structure 
+// Nonce commitment structure - EXACTLY matches secp256k1_frost_nonce_commitment
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t participant_index;
-    uint8_t hiding[32];     
-    uint8_t binding[32];    
+    uint32_t index;
+    uint8_t hiding[64];     // Full 64-byte point serialization
+    uint8_t binding[64];    // Full 64-byte point serialization
 } serialized_nonce_commitment_t;
 #pragma pack(pop)
 
-// Updated signature share structure with public key AND group public key
+// Signature share structure - EXACTLY matches secp256k1_frost_signature_share
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t participant_index;
+    uint32_t index;
     uint8_t response[32];
-    uint8_t public_key[64]; // Public key of the participant
-    uint8_t group_public_key[64]; // Group public key for aggregation
 } serialized_signature_share_t;
 #pragma pack(pop)
 
-// Helper function to print hex data
+// Keypair structure for storing participant keys
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t index;
+    uint32_t max_participants;
+    uint8_t secret[32];
+    uint8_t public_key[64];      // Individual public key (FULL 64 bytes)
+    uint8_t group_public_key[64]; // Group public key (FULL 64 bytes)
+} serialized_keypair_t;
+#pragma pack(pop)
+
+// ================== PRINTING FUNCTIONS ==================
+// Helper function to print hex data (limited to 8 bytes for short displays)
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
     for (size_t i = 0; i < len && i < 8; i++) {
@@ -95,9 +105,22 @@ void print_hex(const char *label, const unsigned char *data, size_t len) {
 
 // Helper function to print full hex data
 void print_full_hex(const char *label, const unsigned char *data, size_t len) {
-    printf("%s: ", label);
+    printf("%s:\n", label);
     for (size_t i = 0; i < len; i++) {
         printf("%02x", data[i]);
+        // Add line break every 32 bytes for readability
+        if ((i + 1) % 32 == 0 && (i + 1) < len) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+}
+
+// Function to print public keys in continuous hex format (like example.c)
+void print_public_key_complete(const char *label, const unsigned char *key, size_t len) {
+    printf("%s: 0x", label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", key[i]);
     }
     printf("\n");
 }
@@ -137,7 +160,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
             
             printf("Trying device path: %s\n", device_interface_detail_data->DevicePath);
             
-            // Try different access modes for better compatibility
             DWORD access_modes[] = {
                 GENERIC_READ | GENERIC_WRITE,
                 GENERIC_WRITE,
@@ -175,8 +197,6 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                             HIDP_CAPS capabilities;
                             if (HidP_GetCaps(preparsed_data, &capabilities) == HIDP_STATUS_SUCCESS) {
                                 printf("  Device capabilities:\n");
-                                printf("    Usage Page: 0x%04X\n", capabilities.UsagePage);
-                                printf("    Usage: 0x%04X\n", capabilities.Usage);
                                 printf("    Input Report Length: %d\n", capabilities.InputReportByteLength);
                                 printf("    Output Report Length: %d\n", capabilities.OutputReportByteLength);
                                 
@@ -190,25 +210,13 @@ comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
                                 free(device_interface_detail_data);
                                 SetupDiDestroyDeviceInfoList(device_info_set);
                                 return comm;
-                            } else {
-                                printf("  Failed to get HID capabilities\n");
                             }
                             HidD_FreePreparsedData(preparsed_data);
-                        } else {
-                            printf("  Failed to get preparsed data\n");
                         }
-                    } else {
-                        printf("  VID/PID mismatch\n");
                     }
-                } else {
-                    printf("  Failed to get device attributes. Error: %lu\n", GetLastError());
                 }
                 CloseHandle(temp_handle);
-            } else {
-                printf("  Failed to open device. Error: %lu\n", GetLastError());
             }
-        } else {
-            printf("Failed to get device interface detail. Error: %lu\n", GetLastError());
         }
         free(device_interface_detail_data);
     }
@@ -231,83 +239,31 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
             return FALSE;
         }
         
-        // Set report ID
-        report[0] = 0x02;
-        
-        // Calculate chunk size - leave room for report ID and length byte
-        size_t available_space = comm->output_report_length - 2; // -1 for report ID, -1 for length
+        report[0] = 0x02; // Report ID
+        size_t available_space = comm->output_report_length - 2;
         size_t remaining = len - bytes_sent;
         size_t chunk_size = (available_space < remaining) ? available_space : remaining;
         
-        // Set the actual data length in the second byte
         report[1] = (uint8_t)chunk_size;
-        
-        // Copy data to report buffer starting at byte 2
         memcpy(report + 2, data_ptr + bytes_sent, chunk_size);
         
-        printf("Sending chunk %zu bytes (sent: %zu/%zu), full report: %d bytes\n", 
-               chunk_size, bytes_sent, len, comm->output_report_length);
+        printf("Sending chunk %zu bytes (sent: %zu/%zu)\n", chunk_size, bytes_sent, len);
         
-        // Try HidD_SetOutputReport first
         if (!HidD_SetOutputReport(comm->hid_handle, report, comm->output_report_length)) {
             DWORD error = GetLastError();
-            printf("HidD_SetOutputReport failed. Error: %lu. Trying WriteFile...\n", error);
-            
-            // Try alternative method using WriteFile
-            DWORD bytes_written;
-            OVERLAPPED overlapped = {0};
-            overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-            
-            if (overlapped.hEvent) {
-                BOOL write_result = WriteFile(comm->hid_handle, report, comm->output_report_length, 
-                                            &bytes_written, &overlapped);
-                if (!write_result) {
-                    DWORD write_error = GetLastError();
-                    if (write_error == ERROR_IO_PENDING) {
-                        // Wait for completion
-                        DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 5000);
-                        if (wait_result == WAIT_OBJECT_0) {
-                            if (GetOverlappedResult(comm->hid_handle, &overlapped, &bytes_written, FALSE)) {
-                                printf("WriteFile method succeeded (%lu bytes)\n", bytes_written);
-                                write_result = TRUE;
-                            } else {
-                                printf("GetOverlappedResult failed. Error: %lu\n", GetLastError());
-                            }
-                        } else {
-                            printf("WriteFile timeout. Wait result: %lu\n", wait_result);
-                        }
-                    } else {
-                        printf("WriteFile failed immediately. Error: %lu\n", write_error);
-                    }
-                }
-                CloseHandle(overlapped.hEvent);
-                
-                if (!write_result) {
-                    printf("Both HID send methods failed\n");
-                    free(report);
-                    return FALSE;
-                }
-            } else {
-                printf("Failed to create event for overlapped I/O\n");
-                free(report);
-                return FALSE;
-            }
-        } else {
-            printf("HidD_SetOutputReport succeeded\n");
+            printf("HidD_SetOutputReport failed. Error: %lu\n", error);
+            free(report);
+            return FALSE;
         }
         
         free(report);
         bytes_sent += chunk_size;
-        
-        // Delay between chunks to prevent overwhelming the receiver
-        Sleep(200);
+        Sleep(200); // Delay between chunks
     }
     
-    printf("Successfully sent all %zu bytes in HID chunks\n", bytes_sent);
     return TRUE;
 }
 
-// Enhanced receive function with chunked data support
 BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len, size_t* total_received) {
     uint8_t* recv_buffer = (uint8_t*)buffer;
     *total_received = 0;
@@ -323,9 +279,8 @@ BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len,
         }
         
         if (bytes_read > 0) {
-            // Parse chunked data: [Report ID][Length][Data...]
             uint8_t report_id = report[0];
-            if (report_id == 0x01 && bytes_read >= 3) { // Input report with data
+            if (report_id == 0x01 && bytes_read >= 3) {
                 uint8_t chunk_len = report[1];
                 if (chunk_len > 0 && chunk_len <= (bytes_read - 2)) {
                     size_t copy_len = (*total_received + chunk_len <= max_len) ? chunk_len : (max_len - *total_received);
@@ -341,7 +296,7 @@ BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len,
                             size_t expected_total = sizeof(message_header_t) + header->payload_len;
                             if (*total_received >= expected_total) {
                                 printf("Complete message received (%zu bytes)\n", expected_total);
-                                *total_received = expected_total; // Trim to exact message size
+                                *total_received = expected_total;
                                 free(report);
                                 return TRUE;
                             }
@@ -352,11 +307,9 @@ BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len,
         }
         
         free(report);
-        
-        // Timeout after reasonable wait
         Sleep(100);
         static int timeout_counter = 0;
-        if (++timeout_counter > 50) { // 5 second timeout
+        if (++timeout_counter > 50) {
             printf("Timeout waiting for complete message\n");
             timeout_counter = 0;
             break;
@@ -425,7 +378,7 @@ BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant,
     
     if (result) {
         printf("Message sent successfully\n");
-        Sleep(500); // Delay after sending
+        Sleep(500);
     }
     
     return result;
@@ -445,14 +398,12 @@ BOOL receive_complete_message(comm_handle_t* comm, uint8_t* buffer, size_t max_l
     
     *header = (message_header_t*)buffer;
     
-    // Validate header
     if ((*header)->magic != MSG_HEADER_MAGIC || (*header)->version != MSG_VERSION) {
         printf("Invalid message header: magic=0x%08x, version=%d\n", 
                (*header)->magic, (*header)->version);
         return FALSE;
     }
     
-    // Set payload pointer
     if ((*header)->payload_len > 0) {
         *payload = buffer + sizeof(message_header_t);
     } else {
@@ -469,11 +420,7 @@ BOOL receive_complete_message(comm_handle_t* comm, uint8_t* buffer, size_t max_l
 HANDLE setup_uart_port(const char *port_name) {
     HANDLE hSerial = CreateFile(port_name,
         GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
+        0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hSerial == INVALID_HANDLE_VALUE) {
         return INVALID_HANDLE_VALUE;
     }
@@ -495,7 +442,7 @@ HANDLE setup_uart_port(const char *port_name) {
 
     COMMTIMEOUTS timeouts = {0};
     timeouts.ReadIntervalTimeout = 100;
-    timeouts.ReadTotalTimeoutConstant = 10000; // 10 second timeout
+    timeouts.ReadTotalTimeoutConstant = 10000;
     timeouts.ReadTotalTimeoutMultiplier = 10;
     timeouts.WriteTotalTimeoutConstant = 1000;
     timeouts.WriteTotalTimeoutMultiplier = 10;
@@ -542,8 +489,7 @@ comm_handle_t setup_communication(int participant_id) {
             comm = find_hid_device(VENDOR_ID, PRODUCT_ID);
             if (comm.type != 0) {
                 printf("USB HID device found!\n");
-                printf("Waiting for device to stabilize...\n");
-                Sleep(1000); // Give device time to stabilize
+                Sleep(1000);
             } else {
                 printf("USB HID device not found\n");
             }
@@ -568,17 +514,18 @@ void close_communication(comm_handle_t* comm) {
     memset(comm, 0, sizeof(comm_handle_t));
 }
 
-// ================== FROST SIGNING FUNCTIONS ==================
+// ================== FROST FUNCTIONS ==================
 void compute_message_hash(unsigned char* msg_hash, const unsigned char* msg, size_t msg_len) {
-    secp256k1_context* sign_verify_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '\0', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
-    int return_val = secp256k1_tagged_sha256(sign_verify_ctx, msg_hash, tag, sizeof(tag), msg, msg_len);
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '_', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
+    int return_val = secp256k1_tagged_sha256(ctx, msg_hash, tag, sizeof(tag), msg, msg_len);
     assert(return_val == 1);
-    secp256k1_context_destroy(sign_verify_ctx);
+    secp256k1_context_destroy(ctx);
 }
 
 // ================== FROST AGGREGATION AND VERIFICATION ==================
 int aggregate_and_verify_signature(serialized_signature_share_t* signature_shares,
+                                   serialized_keypair_t* participant_keypairs,
                                    serialized_nonce_commitment_t* commitments,
                                    int num_shares,
                                    unsigned char* msg_hash,
@@ -586,67 +533,61 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
     
     printf("\n=== AGGREGATING SIGNATURE SHARES ===\n");
     
-    // Create secp256k1 context
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (!ctx) {
         printf("Failed to create secp256k1 context\n");
         return 0;
     }
     
-    // Create a real keypair using the first signature share's data
-    secp256k1_frost_keypair real_keypair;
-    memset(&real_keypair, 0, sizeof(secp256k1_frost_keypair));
-    real_keypair.public_keys.index = signature_shares[0].participant_index;
-    real_keypair.public_keys.max_participants = N;
+    // Create the aggregator keypair using the first participant's data
+    secp256k1_frost_keypair aggregator_keypair;
+    memset(&aggregator_keypair, 0, sizeof(secp256k1_frost_keypair));
     
-    // Use the group public key from the first signature share
-    memcpy(real_keypair.public_keys.group_public_key, 
-           signature_shares[0].group_public_key, 64);
+    // Use first participant's data for aggregation
+    aggregator_keypair.public_keys.index = participant_keypairs[0].index;
+    aggregator_keypair.public_keys.max_participants = participant_keypairs[0].max_participants;
+    memcpy(aggregator_keypair.secret, participant_keypairs[0].secret, 32);
+    memcpy(aggregator_keypair.public_keys.public_key, participant_keypairs[0].public_key, 64);
+    memcpy(aggregator_keypair.public_keys.group_public_key, participant_keypairs[0].group_public_key, 64);
     
-    printf("Using real keypair for aggregation:\n");
-    printf("  Participant index: %u\n", real_keypair.public_keys.index);
-    printf("  Max participants: %u\n", real_keypair.public_keys.max_participants);
-    print_hex("  Group public key", real_keypair.public_keys.group_public_key, 32);
+    printf("Aggregator keypair info:\n");
+    printf("  Index: %u\n", aggregator_keypair.public_keys.index);
+    printf("  Max participants: %u\n", aggregator_keypair.public_keys.max_participants);
     
-    // Create public keys array from received data
-    secp256k1_frost_pubkey public_keys[N];
-    secp256k1_frost_nonce_commitment signing_commitments[N];
-    secp256k1_frost_signature_share frost_signature_shares[N];
+    // Print complete group public key
+    print_public_key_complete("  Group Public Key", aggregator_keypair.public_keys.group_public_key, 64);
     
-    // Convert serialized data to secp256k1_frost structures
+    // Create public keys array
+    secp256k1_frost_pubkey public_keys[T];
+    secp256k1_frost_nonce_commitment signing_commitments[T];
+    secp256k1_frost_signature_share frost_signature_shares[T];
+    
+    // Convert data to secp256k1_frost structures
     for (int i = 0; i < num_shares; i++) {
         // Convert signature shares
-        frost_signature_shares[i].index = signature_shares[i].participant_index;
+        frost_signature_shares[i].index = signature_shares[i].index;
         memcpy(frost_signature_shares[i].response, signature_shares[i].response, 32);
         
-        // Use received public key and group public key
-        public_keys[i].index = signature_shares[i].participant_index;
-        public_keys[i].max_participants = N;
-        memcpy(public_keys[i].public_key, signature_shares[i].public_key, 64);
-        memcpy(public_keys[i].group_public_key, signature_shares[i].group_public_key, 64);
+        // Convert public keys
+        public_keys[i].index = participant_keypairs[i].index;
+        public_keys[i].max_participants = participant_keypairs[i].max_participants;
+        memcpy(public_keys[i].public_key, participant_keypairs[i].public_key, 64);
+        memcpy(public_keys[i].group_public_key, participant_keypairs[i].group_public_key, 64);
         
-        printf("Converted signature share %d: participant %u\n", 
-               i, frost_signature_shares[i].index);
+        // Convert nonce commitments  
+        signing_commitments[i].index = commitments[i].index;
+        memcpy(signing_commitments[i].hiding, commitments[i].hiding, 64);
+        memcpy(signing_commitments[i].binding, commitments[i].binding, 64);
+        
+        printf("Converted participant %d: index %u\n", i, frost_signature_shares[i].index);
         print_hex("  Response", frost_signature_shares[i].response, 32);
-        print_hex("  Public Key", public_keys[i].public_key, 32);
-        print_hex("  Group Public Key", public_keys[i].group_public_key, 32);
     }
     
-    // Convert nonce commitments
-    for (int i = 0; i < num_shares; i++) {
-        signing_commitments[i].index = commitments[i].participant_index;
-        memcpy(signing_commitments[i].hiding, commitments[i].hiding, 32);
-        memcpy(signing_commitments[i].binding, commitments[i].binding, 32);
-        
-        printf("Converted nonce commitment %d: participant %u\n", 
-               i, signing_commitments[i].index);
-    }
+    printf("Attempting signature aggregation...\n");
     
-    printf("Attempting to aggregate %d signature shares with real keypair...\n", num_shares);
-    
-    // Attempt aggregation with real keypair
+    // Aggregate signatures
     int return_val = secp256k1_frost_aggregate(ctx, final_signature, msg_hash,
-                                              &real_keypair, public_keys, 
+                                              &aggregator_keypair, public_keys, 
                                               signing_commitments,
                                               frost_signature_shares, num_shares);
     
@@ -659,32 +600,24 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
         }
         printf("\n");
         
-        // Attempt verification with the real keypair
+        // Verify signature
         printf("\n=== VERIFYING AGGREGATED SIGNATURE ===\n");
         int is_signature_valid = secp256k1_frost_verify(ctx, final_signature, msg_hash, 
-                                                        &real_keypair.public_keys);
+                                                        &aggregator_keypair.public_keys);
         
         printf("Signature verification result: %s\n", 
                is_signature_valid ? "VALID ✓" : "INVALID ✗");
         
         if (is_signature_valid) {
             printf("🎉 SUCCESS: FROST signature is mathematically valid!\n");
-            printf("The signature shares were correctly aggregated using real keypair.\n");
         } else {
             printf("⚠️  WARNING: Signature verification failed.\n");
-            printf("This may indicate protocol errors or implementation issues.\n");
         }
         
         secp256k1_context_destroy(ctx);
         return is_signature_valid;
     } else {
         printf("*** SIGNATURE AGGREGATION FAILED ***\n");
-        printf("Error: Could not aggregate signature shares\n");
-        printf("This may indicate:\n");
-        printf("- Incompatible signature shares\n");
-        printf("- Missing or corrupted nonce commitments\n");
-        printf("- Protocol violation\n");
-        
         secp256k1_context_destroy(ctx);
         return 0;
     }
@@ -692,35 +625,32 @@ int aggregate_and_verify_signature(serialized_signature_share_t* signature_share
 
 // ================== MAIN PROGRAM ==================
 int main(void) {
-    printf("=== FROST Signature Coordinator with Real Keypair ===\n\n");
+    printf("=== FROST Signature Coordinator ===\n\n");
     
-    serialized_nonce_commitment_t commitments[N];
-    serialized_signature_share_t signature_shares[N];
+    serialized_nonce_commitment_t commitments[T];
+    serialized_signature_share_t signature_shares[T];
+    serialized_keypair_t participant_keypairs[T];
     int commitments_received = 0;
     int shares_received = 0;
     uint8_t receive_buffer[1024];
     
-    // Initialize signature shares array
-    memset(signature_shares, 0, sizeof(signature_shares));
-    
-    // Mensaje a firmar
+    // Message to sign
     unsigned char msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
-    unsigned char msghash[32];
-    compute_message_hash(msghash, msg, sizeof(msg));
-    print_hex("Message Hash", msghash, sizeof(msghash));
+    unsigned char msg_hash[32];
+    compute_message_hash(msg_hash, msg, sizeof(msg));
+    print_hex("Message Hash", msg_hash, sizeof(msg_hash));
     
-    // Fase 1: Recopilar compromisos de nonce
-    for (int i = 0; i < N; i++) {
+    // Phase 1: Collect nonce commitments and keypairs
+    for (int i = 0; i < T; i++) {
         printf("\n=== Processing Participant %d (Nonce Commitment) ===\n", i+1);
         
-        // Setup communication
         comm_handle_t comm = setup_communication(i+1);
         if (comm.type == 0) {
             printf("Skipping participant %d due to communication failure\n", i+1);
             continue;
         }
         
-        // Send READY signal to trigger nonce generation
+        // Send READY signal
         printf("Sending READY signal to participant %d...\n", i+1);
         if (!send_message(&comm, MSG_TYPE_READY, i+1, NULL, 0)) {
             printf("Failed to send READY signal to participant %d\n", i+1);
@@ -728,23 +658,41 @@ int main(void) {
             continue;
         }
         
-        // Wait for nonce commitment response
+        // Wait for response
         printf("Waiting for nonce commitment from participant %d...\n", i+1);
         
         message_header_t* header;
         void* payload;
         
         if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), &header, &payload)) {
-            if (header->msg_type == MSG_TYPE_NONCE_COMMITMENT && 
-                header->payload_len == sizeof(serialized_nonce_commitment_t)) {
+            if (header->msg_type == MSG_TYPE_NONCE_COMMITMENT) {
+                // We expect both nonce commitment AND keypair in this message
+                uint8_t* payload_data = (uint8_t*)payload;
                 
-                // Store the commitment
-                memcpy(&commitments[commitments_received], payload, sizeof(serialized_nonce_commitment_t));
+                // First comes the nonce commitment
+                memcpy(&commitments[commitments_received], payload_data, sizeof(serialized_nonce_commitment_t));
                 
-                printf("Received nonce commitment from participant %d (index: %u)\n", 
-                       i+1, commitments[commitments_received].participant_index);
-                print_hex("  Hiding", commitments[commitments_received].hiding, 32);
-                print_hex("  Binding", commitments[commitments_received].binding, 32);
+                // Then comes the keypair
+                memcpy(&participant_keypairs[commitments_received], 
+                       payload_data + sizeof(serialized_nonce_commitment_t), 
+                       sizeof(serialized_keypair_t));
+                
+                printf("\n=== RECEIVED NONCE COMMITMENT FROM PARTICIPANT %d ===\n", i+1);
+                printf("Participant index: %u\n", commitments[commitments_received].index);
+                print_full_hex("Hiding Commitment", commitments[commitments_received].hiding, 64);
+                print_full_hex("Binding Commitment", commitments[commitments_received].binding, 64);
+                
+                printf("\n=== RECEIVED KEYPAIR FROM PARTICIPANT %d ===\n", i+1);
+                printf("Participant index: %u\n", participant_keypairs[commitments_received].index);
+                printf("Max participants: %u\n", participant_keypairs[commitments_received].max_participants);
+                
+                // Print complete individual public key
+                print_public_key_complete("Individual Public Key", 
+                                        participant_keypairs[commitments_received].public_key, 64);
+                
+                // Print complete group public key
+                print_public_key_complete("Group Public Key", 
+                                        participant_keypairs[commitments_received].group_public_key, 64);
                 
                 commitments_received++;
             } else {
@@ -754,10 +702,8 @@ int main(void) {
             printf("Failed to receive nonce commitment from participant %d\n", i+1);
         }
         
-        // Close communication
         close_communication(&comm);
         
-        // Break early if we have enough commitments
         if (commitments_received >= T) {
             printf("\nReceived minimum %d commitments. Continuing...\n", T);
             break;
@@ -773,29 +719,32 @@ int main(void) {
     }
     
     // Display summary
-    printf("\n=== FROST Nonce Commitment Collection Complete ===\n");
+    printf("\n=== FROST NONCE COMMITMENT COLLECTION COMPLETE ===\n");
     printf("Collected %d nonce commitments:\n", commitments_received);
     for (int i = 0; i < commitments_received; i++) {
-        printf("Participant %u:\n", commitments[i].participant_index);
-        print_hex("  Hiding", commitments[i].hiding, 32);
-        print_hex("  Binding", commitments[i].binding, 32);
+        printf("\nParticipant %u:\n", commitments[i].index);
+        print_public_key_complete("  Individual Public Key", 
+                                participant_keypairs[i].public_key, 64);
+        print_public_key_complete("  Group Public Key", 
+                                participant_keypairs[i].group_public_key, 64);
+        print_hex("  Hiding (first 8 bytes)", commitments[i].hiding, 64);
+        print_hex("  Binding (first 8 bytes)", commitments[i].binding, 64);
     }
     
-    // Fase 2: Enviar hash y compromisos a cada dispositivo Y recibir signature shares inmediatamente
+    // Phase 2: Send signing data and collect signature shares
     printf("\n=== Sending Signing Data and Collecting Signature Shares ===\n");
     
     for (int i = 0; i < T; i++) {
-        uint32_t participant_index = commitments[i].participant_index;
+        uint32_t participant_index = commitments[i].index;
         printf("\n=== Processing Participant %u ===\n", participant_index);
         
-        // Setup communication
         comm_handle_t comm = setup_communication(participant_index);
         if (comm.type == 0) {
             printf("Skipping participant %u due to communication failure\n", participant_index);
             continue;
         }
         
-        // Preparar payload: [msghash][num_commitments][commitments...]
+        // Prepare payload: [msg_hash][num_commitments][commitments...]
         uint16_t payload_len = 32 + 4 + T * sizeof(serialized_nonce_commitment_t);
         uint8_t* payload = (uint8_t*)malloc(payload_len);
         if (!payload) {
@@ -803,14 +752,14 @@ int main(void) {
             continue;
         }
         
-        // Copiar msghash (32 bytes)
-        memcpy(payload, msghash, 32);
-        // Copiar num_commitments (T)
+        // Copy message hash
+        memcpy(payload, msg_hash, 32);
+        // Copy number of commitments
         *(uint32_t*)(payload + 32) = T;
-        // Copiar los T compromisos
+        // Copy commitments
         memcpy(payload + 32 + 4, commitments, T * sizeof(serialized_nonce_commitment_t));
         
-        // Enviar mensaje de firma
+        // Send signing message
         printf("Sending signing data to participant %u...\n", participant_index);
         if (!send_message(&comm, MSG_TYPE_SIGN, participant_index, payload, payload_len)) {
             printf("Failed to send signing data to participant %u\n", participant_index);
@@ -819,14 +768,13 @@ int main(void) {
             continue;
         } else {
             printf("Signing data sent successfully to participant %u\n", participant_index);
-            printf("  Message hash sent: ");
-            print_hex("", msghash, 8); // Solo primeros 8 bytes
+            print_hex("  Message hash sent", msg_hash, 8);
             printf("  Number of commitments sent: %d\n", T);
         }
         
         free(payload);
         
-        // Inmediatamente después de enviar, esperar por la signature share
+        // Wait for signature share
         printf("Waiting for signature share from participant %u...\n", participant_index);
         
         message_header_t* header;
@@ -846,27 +794,14 @@ int main(void) {
                     memcpy(&signature_shares[shares_received], sig_share, sizeof(serialized_signature_share_t));
                     
                     printf("\n*** SIGNATURE SHARE RECEIVED from Participant %u ***\n", 
-                           sig_share->participant_index);
+                           sig_share->index);
                     print_full_hex("Signature Share", sig_share->response, 32);
-                    print_hex("Public Key", sig_share->public_key, 32);
-                    print_hex("Group Public Key", sig_share->group_public_key, 32);
                     
-                    // Print signature share in a formatted way
                     printf("\n=== FROST SIGNATURE SHARE %d ===\n", shares_received + 1);
-                    printf("Participant: %u\n", sig_share->participant_index);
+                    printf("Participant: %u\n", sig_share->index);
                     printf("Share: ");
                     for (int j = 0; j < 32; j++) {
                         printf("%02x", sig_share->response[j]);
-                    }
-                    printf("\nPublic Key: ");
-                    for (int j = 0; j < 64; j++) {
-                        printf("%02x", sig_share->public_key[j]);
-                        if (j == 31) printf("\n               "); // New line at half
-                    }
-                    printf("\nGroup Public Key: ");
-                    for (int j = 0; j < 64; j++) {
-                        printf("%02x", sig_share->group_public_key[j]);
-                        if (j == 31) printf("\n                     "); // New line at half
                     }
                     printf("\n===============================\n\n");
                     
@@ -880,7 +815,6 @@ int main(void) {
                 }
             }
             
-            // Small delay before retrying
             Sleep(100);
         }
         
@@ -898,36 +832,27 @@ int main(void) {
         printf("Successfully collected signature shares from %d participants:\n\n", shares_received);
         
         for (int i = 0; i < shares_received; i++) {
-            if (signature_shares[i].participant_index != 0) {
-                printf("Participant %u Signature Share:\n", signature_shares[i].participant_index);
+            if (signature_shares[i].index != 0) {
+                printf("Participant %u Signature Share:\n", signature_shares[i].index);
                 printf("  ");
                 for (int j = 0; j < 32; j++) {
                     printf("%02x", signature_shares[i].response[j]);
-                }
-                printf("\nPublic Key:\n  ");
-                for (int j = 0; j < 64; j++) {
-                    printf("%02x", signature_shares[i].public_key[j]);
-                    if (j == 31) printf("\n  "); // New line at half
-                }
-                printf("\nGroup Public Key:\n  ");
-                for (int j = 0; j < 64; j++) {
-                    printf("%02x", signature_shares[i].group_public_key[j]);
-                    if (j == 31) printf("\n  "); // New line at half
                 }
                 printf("\n\n");
             }
         }
         
-        printf("Proceeding to aggregate signature shares with real keypair...\n");
+        printf("Proceeding to aggregate signature shares...\n");
         
         // ================== SIGNATURE AGGREGATION ==================
         unsigned char final_signature[64];
         memset(final_signature, 0, sizeof(final_signature));
         
         int aggregation_result = aggregate_and_verify_signature(signature_shares, 
+                                                               participant_keypairs,
                                                                commitments,
                                                                shares_received, 
-                                                               msghash, 
+                                                               msg_hash, 
                                                                final_signature);
         
         if (aggregation_result) {
@@ -937,7 +862,6 @@ int main(void) {
             printf("✓ Signature shares collected: %d/%d\n", shares_received, T);
             printf("✓ Signature aggregation: SUCCESS\n");
             printf("✓ Signature verification: SUCCESS\n");
-            printf("✓ Used real keypair with actual group public key\n");
             printf("══════════════════════════════════════════════════════\n");
             
             printf("\nFinal aggregated FROST signature:\n");
@@ -949,9 +873,22 @@ int main(void) {
             printf("Message: \"Hello World!\"\n");
             printf("Hash: ");
             for (int i = 0; i < 32; i++) {
-                printf("%02x", msghash[i]);
+                printf("%02x", msg_hash[i]);
             }
             printf("\n");
+            
+            // Show final complete key information
+            printf("\n=== FINAL KEY INFORMATION ===\n");
+            print_public_key_complete("Group Public Key (Complete)", 
+                                    participant_keypairs[0].group_public_key, 64);
+            
+            printf("\nIndividual Participant Public Keys:\n");
+            for (int i = 0; i < commitments_received; i++) {
+                printf("Participant %u:\n", participant_keypairs[i].index);
+                print_public_key_complete("  Individual Public Key", 
+                                        participant_keypairs[i].public_key, 64);
+            }
+            
         } else {
             printf("\n⚠️  FROST SIGNATURE PROTOCOL COMPLETED WITH ISSUES\n");
             printf("═══════════════════════════════════════════════════════\n");

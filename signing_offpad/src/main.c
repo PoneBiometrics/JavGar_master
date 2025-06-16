@@ -6,11 +6,12 @@
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/atomic.h>
-#include <zephyr/random/rand32.h>
+#include <zephyr/random/random.h>
 #include <string.h>
 #include <secp256k1.h>
 #include <secp256k1_frost.h>
 #include <stdlib.h>
+#include "examples_util.h"
 
 #define LOG_LEVEL LOG_LEVEL_INF
 LOG_MODULE_REGISTER(frost_hid_device);
@@ -22,7 +23,7 @@ LOG_MODULE_REGISTER(frost_hid_device);
 #define REPORT_ID_INPUT  0x01
 #define REPORT_ID_OUTPUT 0x02
 #define HID_EP_BUSY_FLAG 0
-#define HID_REPORT_SIZE  64
+#define MY_HID_REPORT_SIZE  64
 #define CHUNK_SIZE       61
 #define CHUNK_DELAY_MS   50
 
@@ -48,20 +49,27 @@ typedef struct {
     uint32_t participant;  
 } __packed message_header_t;
 
-// Nonce commitment structure
+// Nonce commitment structure - EXACTLY matches secp256k1_frost_nonce_commitment
 typedef struct {
-    uint32_t participant_index;
-    uint8_t hiding[32];
-    uint8_t binding[32];
+    uint32_t index;
+    uint8_t hiding[64];     // Full 64-byte point serialization
+    uint8_t binding[64];    // Full 64-byte point serialization
 } __packed serialized_nonce_commitment_t;
 
-// Updated signature share structure with public key AND group public key
+// Signature share structure - EXACTLY matches secp256k1_frost_signature_share
 typedef struct {
-    uint32_t participant_index;
+    uint32_t index;
     uint8_t response[32];
-    uint8_t public_key[64]; // Public key of the participant
-    uint8_t group_public_key[64]; // Group public key for aggregation
 } __packed serialized_signature_share_t;
+
+// Keypair structure for transmission
+typedef struct {
+    uint32_t index;
+    uint32_t max_participants;
+    uint8_t secret[32];
+    uint8_t public_key[64];      // Individual public key
+    uint8_t group_public_key[64]; // Group public key (same for all)
+} __packed serialized_keypair_t;
 
 // Flash storage structure
 typedef struct {
@@ -69,7 +77,7 @@ typedef struct {
     uint32_t keypair_max_participants;
     uint8_t keypair_secret[32];
     uint8_t keypair_public_key[64];
-    uint8_t keypair_group_public_key[64]; // Changed from 33 to 64 bytes
+    uint8_t keypair_group_public_key[64];
 } __packed frost_flash_storage_t;
 
 // Global state
@@ -78,9 +86,10 @@ static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 static struct k_work sign_work;
 static struct k_work send_share_work;
+static struct k_work report_send;
 static frost_flash_storage_t flash_data;
 static bool flash_data_valid = false;
-static uint8_t chunk_buffer[HID_REPORT_SIZE];
+static uint8_t chunk_buffer[MY_HID_REPORT_SIZE];
 static secp256k1_context *secp256k1_ctx;
 static secp256k1_frost_keypair keypair;
 static secp256k1_frost_nonce *current_nonce = NULL;
@@ -90,41 +99,59 @@ static secp256k1_frost_signature_share computed_signature_share;
 static bool signature_share_computed = false;
 
 // Receive buffer for accumulating messages
-static uint8_t receive_buffer[512];
+#define REASSEMBLY_BUFFER_SIZE 2048
+static uint8_t receive_buffer[REASSEMBLY_BUFFER_SIZE];
 static size_t receive_buffer_pos = 0;
+static size_t expected_total_size = 0;
+static bool reassembling_message = false;
 
-// Fixed HID Report Descriptor
-static const uint8_t hid_report_desc[] = {
-    0x06, 0x00, 0xFF,       // Usage Page (Vendor)
-    0x09, 0x01,             // Usage (Custom)
-    0xA1, 0x01,             // Collection (Application)
-    
-    // Input Report (Device to Host)
-    0x85, REPORT_ID_INPUT,  // Report ID (Input)
-    0x09, 0x02,             // Usage (Data)
-    0x15, 0x00,             // Logical Min (0)
-    0x26, 0xFF, 0x00,       // Logical Max (255)
-    0x75, 0x08,             // Report Size (8)
-    0x95, 0x3F,             // Report Count (63)
-    0x81, 0x02,             // Input (Data,Var,Abs)
-    
-    // Output Report (Host to Device) 
-    0x85, REPORT_ID_OUTPUT, // Report ID (Output)
-    0x09, 0x03,             // Usage (Feature)
-    0x15, 0x00,             // Logical Min (0)
-    0x26, 0xFF, 0x00,       // Logical Max (255)
-    0x75, 0x08,             // Report Size (8)
-    0x95, 0x3F,             // Report Count (63)
-    0x91, 0x02,             // Output (Data,Var,Abs)
-    
-    0xC0                    // End Collection
+// Mutex to protect buffer access
+K_MUTEX_DEFINE(buffer_mutex);
+
+// Report structure
+static struct report {
+	uint8_t id;
+	uint8_t value;
+} __packed report_1 = {
+	.id = REPORT_ID_INPUT,
+	.value = 0,
 };
 
-// Fill buffer with random data
-static bool fill_random(unsigned char *data, size_t len) {
-    sys_csrand_get(data, len);
-    return true;
-}
+// Timer for periodic reports
+static void report_event_handler(struct k_timer *dummy);
+K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
+#define REPORT_PERIOD K_SECONDS(2)
+
+// Timeout handling for stuck receive states
+static void receive_timeout_handler(struct k_timer *timer);
+K_TIMER_DEFINE(receive_timeout_timer, receive_timeout_handler, NULL);
+
+// Fixed HID Report Descriptor - Using the working version format
+static const uint8_t hid_report_desc[] = {
+	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_COLLECTION(HID_COLLECTION_APPLICATION),
+	
+	// Input report (device to host)
+	HID_REPORT_ID(REPORT_ID_INPUT),
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_SIZE(8),
+	HID_REPORT_COUNT(63),  // 63 bytes data + 1 byte report ID = 64 total
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_INPUT(0x02),
+	
+	// Output report (host to device)
+	HID_REPORT_ID(REPORT_ID_OUTPUT),
+	HID_LOGICAL_MIN8(0x00),
+	HID_LOGICAL_MAX16(0xFF, 0x00),
+	HID_REPORT_SIZE(8),
+	HID_REPORT_COUNT(63),  // 63 bytes data + 1 byte report ID = 64 total
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_OUTPUT(0x02),
+	
+	HID_END_COLLECTION,
+};
 
 // Helper function to log hex data
 static void log_hex(const char *label, const uint8_t *data, size_t len) {
@@ -143,7 +170,17 @@ static void log_hex(const char *label, const uint8_t *data, size_t len) {
     }
 }
 
-// Generate nonce at startup
+// Function to reset reassembly state
+static void reset_reassembly_state(void)
+{
+    reassembling_message = false;
+    receive_buffer_pos = 0;
+    expected_total_size = 0;
+    k_timer_stop(&receive_timeout_timer);
+    LOG_INF("Reassembly state reset");
+}
+
+// Generate nonce at startup - exactly like example.c
 static void generate_nonce(void) {
     unsigned char binding_seed[32] = {0};
     unsigned char hiding_seed[32] = {0};
@@ -161,6 +198,7 @@ static void generate_nonce(void) {
         secp256k1_frost_nonce_destroy(current_nonce);
     }
     
+    // Create nonce exactly like example.c
     current_nonce = secp256k1_frost_nonce_create(
         secp256k1_ctx, &keypair, binding_seed, hiding_seed);
     
@@ -170,146 +208,6 @@ static void generate_nonce(void) {
         log_hex("Nonce binding", current_nonce->commitments.binding, 32);
     } else {
         LOG_ERR("Failed to generate nonce at startup");
-    }
-}
-
-// Process accumulated message data
-static void process_received_message(void) {
-    LOG_DBG("Processing receive buffer: %zu bytes", receive_buffer_pos);
-    
-    if (receive_buffer_pos < sizeof(message_header_t)) {
-        LOG_DBG("Insufficient data for header (%zu bytes, need %zu)", 
-                receive_buffer_pos, sizeof(message_header_t));
-        return;
-    }
-    
-    const message_header_t *header = (const message_header_t *)receive_buffer;
-    
-    LOG_DBG("Header check: magic=0x%08x (expected=0x%08x), version=%d, type=0x%02x, len=%d", 
-            header->magic, MSG_HEADER_MAGIC, header->version, header->msg_type, header->payload_len);
-    
-    // Validate message header
-    if (header->magic != MSG_HEADER_MAGIC || header->version != MSG_VERSION) {
-        LOG_WRN("Invalid message header: magic=0x%08x, version=%d", 
-                header->magic, header->version);
-        // Reset buffer on invalid message
-        receive_buffer_pos = 0;
-        return;
-    }
-    
-    // Check if we have the complete message
-    size_t expected_total = sizeof(message_header_t) + header->payload_len;
-    if (receive_buffer_pos < expected_total) {
-        LOG_DBG("Waiting for more data: have %zu, need %zu", receive_buffer_pos, expected_total);
-        return;
-    }
-    
-    // Process the message
-    const uint8_t* payload = receive_buffer + sizeof(message_header_t);
-    
-    switch (header->msg_type) {
-        case MSG_TYPE_READY:
-            LOG_INF("*** Received READY signal from host (participant %u) ***", header->participant);
-            k_work_submit(&sign_work);
-            break;
-            
-        case MSG_TYPE_SIGN:
-            LOG_INF("*** Received SIGN request from host (participant %u) ***", header->participant);
-            k_work_submit(&sign_work);
-            break;
-            
-        default:
-            LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
-            break;
-    }
-    
-    // Reset buffer after processing
-    LOG_DBG("Resetting receive buffer");
-    receive_buffer_pos = 0;
-}
-
-// HID callbacks
-static void int_in_ready_cb(const struct device *dev) {
-    atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-}
-
-static void int_out_ready_cb(const struct device *dev) {
-    uint8_t buffer[HID_REPORT_SIZE];
-    int ret, received;
-    
-    ret = hid_int_ep_read(dev, buffer, sizeof(buffer), &received);
-    if (ret == 0 && received > 0) {
-        LOG_DBG("Received %d bytes from host", received);
-        
-        // Debug: Print received buffer
-        if (received >= 3) {
-            LOG_DBG("Raw HID data: ID=0x%02X, Len=%d, Data[0]=0x%02X, Data[1]=0x%02X", 
-                    buffer[0], received > 1 ? buffer[1] : 0, 
-                    received > 2 ? buffer[2] : 0, received > 3 ? buffer[3] : 0);
-        }
-        
-        // Process HID report: [Report ID][Length][Data...]
-        if (received >= 3 && buffer[0] == REPORT_ID_OUTPUT) {
-            uint8_t chunk_len = buffer[1];
-            
-            LOG_DBG("Processing chunk: report_id=%d, chunk_len=%d", buffer[0], chunk_len);
-            
-            if (chunk_len > 0 && chunk_len <= (received - 2)) {
-                size_t available_space = sizeof(receive_buffer) - receive_buffer_pos;
-                size_t copy_len = (chunk_len < available_space) ? chunk_len : available_space;
-                
-                if (copy_len > 0) {
-                    memcpy(receive_buffer + receive_buffer_pos, buffer + 2, copy_len);
-                    receive_buffer_pos += copy_len;
-                    
-                    LOG_DBG("Appended %zu bytes to receive buffer (total: %zu)", 
-                            copy_len, receive_buffer_pos);
-                    
-                    // Try to process the accumulated message
-                    process_received_message();
-                } else {
-                    LOG_WRN("No space available in receive buffer");
-                }
-            } else {
-                LOG_WRN("Invalid chunk length: %d (received: %d)", chunk_len, received);
-            }
-        } else {
-            LOG_WRN("Invalid HID report format: ID=0x%02X, received=%d", 
-                    received > 0 ? buffer[0] : 0, received);
-        }
-    } else if (ret != 0) {
-        LOG_ERR("Failed to read from HID endpoint: %d", ret);
-    }
-}
-
-static void protocol_cb(const struct device *dev, uint8_t protocol) {
-    LOG_INF("Protocol: %s", protocol == HID_PROTOCOL_BOOT ? "boot" : "report");
-}
-
-static const struct hid_ops ops = {
-    .int_in_ready = int_in_ready_cb,
-    .int_out_ready = int_out_ready_cb,
-    .protocol_change = protocol_cb,
-};
-
-// USB status callback
-static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
-    switch (status) {
-    case USB_DC_RESET:
-        configured = false;
-        receive_buffer_pos = 0;
-        LOG_INF("USB Reset");
-        break;
-    case USB_DC_CONFIGURED:
-        if (!configured) {
-            atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-            configured = true;
-            receive_buffer_pos = 0;
-            LOG_INF("USB Configured - Ready");
-        }
-        break;
-    default:
-        break;
     }
 }
 
@@ -346,7 +244,7 @@ static int read_frost_data_from_flash(void) {
     return 0;
 }
 
-// Load key material into secp256k1 structure
+// Load key material into secp256k1 structure - exactly like example.c
 static int load_frost_key_material(void) {
     if (!flash_data_valid) return -1;
     
@@ -439,29 +337,51 @@ static int send_message(uint8_t msg_type, uint32_t participant,
     return ret;
 }
 
-// Generate and send nonce commitment
-static int send_nonce_commitment(void) {
+// Generate and send nonce commitment AND keypair
+static int send_nonce_commitment_and_keypair(void) {
     if (!current_nonce) {
         LOG_ERR("No nonce available to send commitment");
         return -1;
     }
     
-    serialized_nonce_commitment_t serialized = {
-        .participant_index = keypair.public_keys.index
-    };
-    memcpy(serialized.hiding, current_nonce->commitments.hiding, 32);
-    memcpy(serialized.binding, current_nonce->commitments.binding, 32);
-    
-    LOG_INF("Sending nonce commitment for participant %u", keypair.public_keys.index);
+    // Prepare combined payload: nonce_commitment + keypair
+    size_t payload_len = sizeof(serialized_nonce_commitment_t) + sizeof(serialized_keypair_t);
+    uint8_t* combined_payload = malloc(payload_len);
+    if (!combined_payload) {
+        LOG_ERR("Failed to allocate memory for combined payload");
+        return -ENOMEM;
+    }
+
+    // First part: nonce commitment
+    serialized_nonce_commitment_t* nonce_part = (serialized_nonce_commitment_t*)combined_payload;
+    nonce_part->index = keypair.public_keys.index;
+    // Copy the full 64-byte commitments exactly as they are
+    memcpy(nonce_part->hiding, current_nonce->commitments.hiding, 64);
+    memcpy(nonce_part->binding, current_nonce->commitments.binding, 64);
+
+    // Second part: keypair
+    serialized_keypair_t* keypair_part = (serialized_keypair_t*)(combined_payload + sizeof(serialized_nonce_commitment_t));
+    keypair_part->index = keypair.public_keys.index;
+    keypair_part->max_participants = keypair.public_keys.max_participants;
+    memcpy(keypair_part->secret, keypair.secret, 32);
+    memcpy(keypair_part->public_key, keypair.public_keys.public_key, 64);
+    memcpy(keypair_part->group_public_key, keypair.public_keys.group_public_key, 64);
+
+    LOG_INF("Sending nonce commitment and keypair for participant %u", keypair.public_keys.index);
+    log_hex("Sending hiding commitment", nonce_part->hiding, 32);
+    log_hex("Sending binding commitment", nonce_part->binding, 32);
+    log_hex("Sending public key", keypair_part->public_key, 32);
+    log_hex("Sending group public key", keypair_part->group_public_key, 32);
     
     int ret = send_message(MSG_TYPE_NONCE_COMMITMENT, 
                           keypair.public_keys.index,
-                          &serialized, sizeof(serialized));
+                          combined_payload, payload_len);
     
+    free(combined_payload);
     return ret;
 }
 
-// Updated function to send signature share with public key AND group public key
+// Function to send signature share
 static int send_signature_share(void) {
     if (!signature_share_computed) {
         LOG_ERR("No signature share computed yet");
@@ -469,17 +389,12 @@ static int send_signature_share(void) {
     }
 
     serialized_signature_share_t serialized = {
-        .participant_index = keypair.public_keys.index
+        .index = keypair.public_keys.index
     };
     memcpy(serialized.response, computed_signature_share.response, 32);
-    // Include public key and group public key in the response
-    memcpy(serialized.public_key, keypair.public_keys.public_key, 64);
-    memcpy(serialized.group_public_key, keypair.public_keys.group_public_key, 64);
 
-    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR WITH PUBLIC KEY AND GROUP PUBLIC KEY ***");
+    LOG_INF("*** SENDING SIGNATURE SHARE TO COORDINATOR ***");
     log_hex("Signature Share", serialized.response, 32);
-    log_hex("Public Key", serialized.public_key, 32);
-    log_hex("Group Public Key", serialized.group_public_key, 32);
 
     int ret = send_message(MSG_TYPE_SIGNATURE_SHARE, 
                           keypair.public_keys.index,
@@ -496,7 +411,7 @@ static int send_signature_share(void) {
     return ret;
 }
 
-// Process signing data and compute signature share
+// Process signing data and compute signature share - exactly like example.c
 static void process_sign_message(void) {
     const message_header_t *header = (const message_header_t *)receive_buffer;
     const uint8_t* payload = receive_buffer + sizeof(message_header_t);
@@ -536,12 +451,12 @@ static void process_sign_message(void) {
     }
     
     for (uint32_t i = 0; i < num_commitments; i++) {
-        signing_commitments[i].index = serialized_commitments[i].participant_index;
-        memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 32);
-        memcpy(signing_commitments[i].binding, serialized_commitments[i].binding, 32);
+        signing_commitments[i].index = serialized_commitments[i].index;
+        memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 64);
+        memcpy(signing_commitments[i].binding, serialized_commitments[i].binding, 64);
     }
     
-    // Compute signature share
+    // Compute signature share EXACTLY like example.c
     int return_val = secp256k1_frost_sign(&computed_signature_share,
                                          msg_hash, num_commitments,
                                          &keypair, current_nonce, signing_commitments);
@@ -552,7 +467,7 @@ static void process_sign_message(void) {
         LOG_INF("*** SIGNATURE SHARE COMPUTED SUCCESSFULLY ***");
         log_hex("SIGNATURE SHARE (32 bytes)", computed_signature_share.response, 32);
         
-        // Print signature share to console
+        // Print signature share to console - exactly like example.c
         char hex_str[65];
         for (int i = 0; i < 32; i++) {
             sprintf(hex_str + i * 2, "%02x", computed_signature_share.response[i]);
@@ -573,6 +488,175 @@ static void process_sign_message(void) {
     
     // Clean up
     free(signing_commitments);
+}
+
+// Process accumulated message data
+static void process_received_message(void) {
+    LOG_DBG("Processing receive buffer: %zu bytes", receive_buffer_pos);
+    
+    if (receive_buffer_pos < sizeof(message_header_t)) {
+        LOG_DBG("Insufficient data for header (%zu bytes, need %zu)", 
+                receive_buffer_pos, sizeof(message_header_t));
+        return;
+    }
+    
+    const message_header_t *header = (const message_header_t *)receive_buffer;
+    
+    LOG_DBG("Header check: magic=0x%08x (expected=0x%08x), version=%d, type=0x%02x, len=%d", 
+            header->magic, MSG_HEADER_MAGIC, header->version, header->msg_type, header->payload_len);
+    
+    // Validate message header
+    if (header->magic != MSG_HEADER_MAGIC || header->version != MSG_VERSION) {
+        LOG_WRN("Invalid message header: magic=0x%08x, version=%d", 
+                header->magic, header->version);
+        // Reset buffer on invalid message
+        receive_buffer_pos = 0;
+        return;
+    }
+    
+    // Check if we have the complete message
+    size_t expected_total = sizeof(message_header_t) + header->payload_len;
+    if (receive_buffer_pos < expected_total) {
+        LOG_DBG("Waiting for more data: have %zu, need %zu", receive_buffer_pos, expected_total);
+        return;
+    }
+    
+    // Process the message
+    switch (header->msg_type) {
+        case MSG_TYPE_READY:
+            LOG_INF("*** Received READY signal from host (participant %u) ***", header->participant);
+            k_work_submit(&sign_work);
+            break;
+            
+        case MSG_TYPE_SIGN:
+            LOG_INF("*** Received SIGN request from host (participant %u) ***", header->participant);
+            k_work_submit(&sign_work);
+            break;
+            
+        default:
+            LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
+            break;
+    }
+    
+    // Reset buffer after processing
+    LOG_DBG("Resetting receive buffer");
+    receive_buffer_pos = 0;
+}
+
+// Enhanced chunked data handler
+static void handle_chunked_data(const uint8_t *data, size_t len)
+{
+    if (!data || len < 3) {  // Report ID + Length + at least 1 byte data
+        LOG_WRN("Invalid chunk: too small (%zu bytes)", len);
+        return;
+    }
+    
+    if (k_mutex_lock(&buffer_mutex, K_MSEC(100)) != 0) {
+        LOG_ERR("Mutex lock failed");
+        return;
+    }
+    
+    // Extract chunk info: [Report ID][Length][Data...]
+    uint8_t report_id = data[0];
+    uint8_t chunk_len = data[1];
+    const uint8_t *chunk_data = data + 2;
+    
+    // Validate chunk
+    if (report_id != REPORT_ID_OUTPUT) {
+        LOG_WRN("Wrong report ID: 0x%02x", report_id);
+        k_mutex_unlock(&buffer_mutex);
+        return;
+    }
+    
+    if (chunk_len == 0 || chunk_len > (len - 2)) {
+        LOG_WRN("Invalid chunk length: %u (packet size: %zu)", chunk_len, len);
+        k_mutex_unlock(&buffer_mutex);
+        return;
+    }
+    
+    LOG_INF("CHUNK: %u bytes, reassembly=%d, pos=%zu/%zu", 
+            chunk_len, reassembling_message, receive_buffer_pos, expected_total_size);
+    
+    // Check if this is the start of a new message
+    if (!reassembling_message && chunk_len >= sizeof(message_header_t)) {
+        const message_header_t *header = (const message_header_t *)chunk_data;
+        if (header->magic == MSG_HEADER_MAGIC) {
+            // This is a new message start
+            expected_total_size = sizeof(message_header_t) + header->payload_len;
+            
+            if (expected_total_size <= REASSEMBLY_BUFFER_SIZE) {
+                reassembling_message = true;
+                receive_buffer_pos = 0;
+                LOG_INF("NEW MESSAGE START: type=0x%02x, total=%zu bytes expected", 
+                        header->msg_type, expected_total_size);
+                
+                // Start timeout timer
+                k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
+            } else {
+                LOG_ERR("Message too large: %zu > %d", expected_total_size, REASSEMBLY_BUFFER_SIZE);
+                k_mutex_unlock(&buffer_mutex);
+                return;
+            }
+        } else {
+            LOG_WRN("Not a message start (magic=0x%08x)", header->magic);
+            k_mutex_unlock(&buffer_mutex);
+            return;
+        }
+    }
+    
+    // Add chunk to reassembly buffer if we're reassembling
+    if (reassembling_message) {
+        size_t space_available = REASSEMBLY_BUFFER_SIZE - receive_buffer_pos;
+        size_t bytes_to_copy = (chunk_len > space_available) ? space_available : chunk_len;
+        
+        if (bytes_to_copy > 0) {
+            memcpy(receive_buffer + receive_buffer_pos, chunk_data, bytes_to_copy);
+            receive_buffer_pos += bytes_to_copy;
+            
+            LOG_INF("REASSEMBLY: %zu/%zu bytes (+%zu)", 
+                    receive_buffer_pos, expected_total_size, bytes_to_copy);
+            
+            // Check if message is complete
+            if (receive_buffer_pos >= expected_total_size) {
+                LOG_INF("MESSAGE COMPLETE: Processing %zu bytes", expected_total_size);
+                
+                // Stop timeout timer
+                k_timer_stop(&receive_timeout_timer);
+                
+                // Process the complete message
+                process_received_message();
+                
+                // Reset for next message
+                reset_reassembly_state();
+                
+                // If we received more data than expected, handle overflow
+                if (receive_buffer_pos > expected_total_size) {
+                    size_t overflow = receive_buffer_pos - expected_total_size;
+                    LOG_WRN("Data overflow: %zu bytes", overflow);
+                }
+            }
+        } else {
+            LOG_ERR("No space in reassembly buffer");
+            reset_reassembly_state();
+        }
+    } else {
+        LOG_WRN("Received chunk but not reassembling - discarded %u bytes", chunk_len);
+    }
+    
+    k_mutex_unlock(&buffer_mutex);
+}
+
+// Timeout handler to reset stuck receive state
+static void receive_timeout_handler(struct k_timer *timer)
+{
+    if (k_mutex_lock(&buffer_mutex, K_MSEC(10)) == 0) {
+        if (reassembling_message) {
+            LOG_WRN("Reassembly timeout - resetting state (had %zu/%zu bytes)", 
+                    receive_buffer_pos, expected_total_size);
+            reset_reassembly_state();
+        }
+        k_mutex_unlock(&buffer_mutex);
+    }
 }
 
 // Work handler for sending signature share
@@ -604,7 +688,7 @@ static void sign_work_handler(struct k_work *work) {
     switch (header->msg_type) {
         case MSG_TYPE_READY:
             LOG_INF("Processing READY message");
-            if (send_nonce_commitment() == 0) {
+            if (send_nonce_commitment_and_keypair() == 0) {
                 // Send end transmission marker
                 send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
             }
@@ -621,11 +705,116 @@ static void sign_work_handler(struct k_work *work) {
     }
 }
 
+// Report work handler
+static void send_report(struct k_work *work)
+{
+	int ret, wrote;
+
+	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
+		ret = hid_int_ep_write(hdev, (uint8_t *)&report_1,
+				       sizeof(report_1), &wrote);
+		if (ret != 0) {
+			LOG_ERR("Report send failed: %d", ret);
+		}
+	}
+}
+
+// Timer event handler
+static void report_event_handler(struct k_timer *dummy)
+{
+	if (!configured) {
+		if (report_1.value < 100) {
+			report_1.value++;
+		} else {
+			report_1.value = 1;
+		}
+		k_work_submit(&report_send);
+	}
+}
+
+// HID callbacks
+static void int_in_ready_cb(const struct device *dev) {
+    atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+}
+
+static void int_out_ready_cb(const struct device *dev) {
+    uint8_t buffer[64];
+    int ret, received;
+    
+    ret = hid_int_ep_read(dev, buffer, sizeof(buffer), &received);
+    if (ret == 0 && received > 0) {
+        // Reset/update timeout on successful data reception
+        k_timer_stop(&receive_timeout_timer);
+        if (reassembling_message) {
+            k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
+        }
+        
+        handle_chunked_data(buffer, received);
+    }
+}
+
+static int set_report_cb(const struct device *dev, struct usb_setup_packet *setup,
+			 int32_t *len, uint8_t **data)
+{
+	if (*len > 0 && *data) {
+		// Reset/update timeout on successful data reception
+		k_timer_stop(&receive_timeout_timer);
+		if (reassembling_message) {
+			k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
+		}
+		
+		handle_chunked_data(*data, *len);
+	}
+	return 0;
+}
+
+static void on_idle_cb(const struct device *dev, uint16_t report_id)
+{
+	k_work_submit(&report_send);
+}
+
+static void protocol_cb(const struct device *dev, uint8_t protocol) {
+    LOG_INF("Protocol: %s", protocol == HID_PROTOCOL_BOOT ? "boot" : "report");
+}
+
+static const struct hid_ops ops = {
+    .int_in_ready = int_in_ready_cb,
+    .int_out_ready = int_out_ready_cb,
+    .on_idle = on_idle_cb,
+    .protocol_change = protocol_cb,
+    .set_report = set_report_cb,
+};
+
+// USB status callback
+static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
+    switch (status) {
+    case USB_DC_RESET:
+        configured = false;
+        LOG_INF("USB Reset");
+        // Reset reassembly state on USB reset
+        if (k_mutex_lock(&buffer_mutex, K_MSEC(100)) == 0) {
+            reset_reassembly_state();
+            k_mutex_unlock(&buffer_mutex);
+        }
+        break;
+    case USB_DC_CONFIGURED:
+        if (!configured) {
+            atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+            configured = true;
+            receive_buffer_pos = 0;
+            LOG_INF("USB Configured - Ready");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 int main(void) {
     int ret;
     LOG_INF("=== FROST HID Signing Device Starting ===");
     
-    // Create secp256k1 context
+    // Create secp256k1 context EXACTLY like example.c
     secp256k1_ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (secp256k1_ctx == NULL) {
@@ -636,6 +825,7 @@ int main(void) {
     // Initialize work queues
     k_work_init(&sign_work, sign_work_handler);
     k_work_init(&send_share_work, send_share_work_handler);
+    k_work_init(&report_send, send_report);
     
     // Read flash data
     if (read_frost_data_from_flash() != 0) {
@@ -660,6 +850,11 @@ int main(void) {
     }
     
     usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc), &ops);
+    
+    // Start periodic timer
+    atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+    k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
+    
     ret = usb_hid_init(hdev);
     if (ret != 0) {
         LOG_ERR("Failed to initialize HID: %d", ret);
@@ -673,6 +868,7 @@ int main(void) {
     }
     
     LOG_INF("=== FROST HID Device Ready ===");
+    LOG_INF("Reassembly buffer size: %d bytes", REASSEMBLY_BUFFER_SIZE);
     
     // Main loop
     while (1) {

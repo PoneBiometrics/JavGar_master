@@ -14,7 +14,7 @@ LOG_MODULE_REGISTER(frost_receiver, LOG_LEVEL_INF);
 
 #define RING_BUF_SIZE 1024
 #define MAX_MSG_SIZE 512
-#define UART_DEVICE_NODE DT_NODELABEL(usart1) // usart1 if attaching a new USB in the pins, yellow to D8 and orange to D2 (using COM different to COM3) or usart2 if using COM3 (in this case not possible to debug at the same time)
+#define UART_DEVICE_NODE DT_NODELABEL(usart1) 
 
 // Message protocol definitions - must match sender
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
@@ -39,14 +39,14 @@ typedef struct {
 
 #define STORAGE_PARTITION     storage_partition
 
-// Serializable version of our FROST structures for flash storage
+// Corrected storage structure to match example format (64-byte keys)
 typedef struct {
     // Keypair storage
     uint32_t keypair_index;
     uint32_t keypair_max_participants;
     uint8_t keypair_secret[32];
-    uint8_t keypair_public_key[64];
-    uint8_t keypair_group_public_key[33];
+    uint8_t keypair_public_key[64];     // 64 bytes like example
+    uint8_t keypair_group_public_key[64]; // 64 bytes like example
 
     // Commitments storage
     uint32_t commitments_index;
@@ -78,13 +78,13 @@ static message_header_t current_header;
 static uint8_t payload_buffer[MAX_MSG_SIZE];
 static size_t payload_bytes_received = 0;
 
-// Helper function to print hex data
+// Helper function to log hex data
 void log_hex_bytes(const char *label, const unsigned char *data, size_t len) {
     char hex_buf[3 * MAX_MSG_SIZE + 1];
     size_t pos = 0;
 
     for (size_t i = 0; i < len && pos < sizeof(hex_buf) - 3; i++) {
-        pos += snprintk(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", data[i]);
+        pos += snprintf(&hex_buf[pos], sizeof(hex_buf) - pos, "%02x ", data[i]);
     }
 
     hex_buf[pos] = '\0';
@@ -108,7 +108,7 @@ int write_frost_data_to_flash(void) {
     flash_data.keypair_max_participants = keypair.public_keys.max_participants;
     memcpy(flash_data.keypair_secret, keypair.secret, 32);
     memcpy(flash_data.keypair_public_key, keypair.public_keys.public_key, 64);
-    memcpy(flash_data.keypair_group_public_key, keypair.public_keys.group_public_key, 33);
+    memcpy(flash_data.keypair_group_public_key, keypair.public_keys.group_public_key, 64);
 
     // Get flash device details
     const struct device *flash_dev = flash_area_get_device(fa);
@@ -193,10 +193,10 @@ int read_frost_data_from_flash(void) {
     hex_buf[128] = '\0';
     LOG_INF("Public Key: %s", hex_buf);
 
-    for (int i = 0; i < 33; i++) {
+    for (int i = 0; i < 64; i++) {
         sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_group_public_key[i]);
     }
-    hex_buf[66] = '\0';
+    hex_buf[128] = '\0';
     LOG_INF("Group Public Key: %s", hex_buf);
 
     flash_area_close(fa);
@@ -221,10 +221,10 @@ static void process_secret_share(const uint8_t *payload, uint16_t len) {
     log_hex_bytes("Secret share", keypair.secret, 32);
 }
 
-// Process a public key message
+// Process a public key message - CORRECTED for 64-byte format
 static void process_public_key(const uint8_t *payload, uint16_t len) {
-    if (len != sizeof(uint32_t) * 2 + 64 + 33) {
-        LOG_ERR("Invalid public key payload size: %d", len);
+    if (len != sizeof(uint32_t) * 2 + 64 + 64) { // Updated for 64-byte keys
+        LOG_ERR("Invalid public key payload size: %d (expected %zu)", len, sizeof(uint32_t) * 2 + 64 + 64);
         return;
     }
     
@@ -243,12 +243,12 @@ static void process_public_key(const uint8_t *payload, uint16_t len) {
     keypair.public_keys.max_participants = max_participants;
     memcpy(keypair.public_keys.public_key, ptr, 64);
     ptr += 64;
-    memcpy(keypair.public_keys.group_public_key, ptr, 33);
+    memcpy(keypair.public_keys.group_public_key, ptr, 64); // Updated to 64 bytes
     
     LOG_INF("Received public key for index %d (max participants: %d)",
            index, max_participants);
     log_hex_bytes("Public key", keypair.public_keys.public_key, 64);
-    log_hex_bytes("Group public key", keypair.public_keys.group_public_key, 33);
+    log_hex_bytes("Group public key", keypair.public_keys.group_public_key, 64);
 }
 
 // Process a commitments message
