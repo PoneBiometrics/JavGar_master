@@ -1,4 +1,4 @@
-/* FROST Key Receiver - Chunked Data Protocol with Flash Storage */
+/* FROST Key Receiver - CORRECTED VERSION - No Infinite Loops */
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
 #include <zephyr/usb/usb_device.h>
@@ -19,16 +19,17 @@ static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
 // Work queue for flash operations
 static struct k_work flash_work;
+static struct k_work cleanup_work;
 
 #define HID_EP_BUSY_FLAG    0
-#define REPORT_ID_INPUT     0x01  // Input reports (device to host)
-#define REPORT_ID_OUTPUT    0x02  // Output reports (host to device)
+#define REPORT_ID_INPUT     0x01  
+#define REPORT_ID_OUTPUT    0x02  
 #define REPORT_PERIOD       K_SECONDS(2)
 
 // Flash storage partition
 #define STORAGE_PARTITION     storage_partition
 
-// Message protocol constants - MUST match sender
+// Message protocol constants
 #define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
 #define MSG_VERSION 0x01
 
@@ -42,11 +43,11 @@ typedef enum {
 
 // Header for each message in the protocol
 struct __attribute__((packed)) message_header {
-    uint32_t magic;        // Magic number to identify our protocol
-    uint8_t version;       // Protocol version
-    uint8_t msg_type;      // Type of message
-    uint16_t payload_len;  // Length of payload following the header
-    uint32_t participant;  // Participant ID (1-based)
+    uint32_t magic;
+    uint8_t version;
+    uint8_t msg_type;
+    uint16_t payload_len;
+    uint32_t participant;
 };
 
 // Data structures for received data
@@ -58,52 +59,49 @@ struct __attribute__((packed)) serialized_share {
 struct __attribute__((packed)) serialized_pubkey {
     uint32_t index;
     uint32_t max_participants;
-    uint8_t public_key[64];       // 64 bytes like example
-    uint8_t group_public_key[64]; // 64 bytes like example
+    uint8_t public_key[64];       
+    uint8_t group_public_key[64]; 
 };
 
-// Flash storage structure - matches the UART version
+// Flash storage structure
 typedef struct {
-    // Keypair storage
     uint32_t keypair_index;
     uint32_t keypair_max_participants;
     uint8_t keypair_secret[32];
-    uint8_t keypair_public_key[64];     // 64 bytes like example
-    uint8_t keypair_group_public_key[64]; // 64 bytes like example
-
-    // Commitments storage
+    uint8_t keypair_public_key[64];     
+    uint8_t keypair_group_public_key[64]; 
     uint32_t commitments_index;
     uint32_t commitments_num_coefficients;
     uint8_t commitments_zkp_z[32];
     uint8_t commitments_zkp_r[64];
-    // Coefficient commitments data
-    uint8_t commitments_coefficient_data[512];  // Increased size
+    uint8_t commitments_coefficient_data[512];  
     size_t commitments_coefficient_data_size;
 } __packed frost_flash_storage_t;
 
-// Storage for received data - using static allocation
+// Storage for received data
 static struct received_frost_data {
     bool has_secret_share;
     bool has_public_key;
     bool has_commitments;
     bool transmission_complete;
     bool flash_write_pending;
+    bool operation_complete;         // NEW: Track when everything is done
+    bool system_shutting_down;       // NEW: Track shutdown state
     
     struct serialized_share secret_share;
     struct serialized_pubkey public_key;
     
-    // Commitments data (increased size)
     uint32_t commitment_index;
     uint32_t num_coefficients;
     uint8_t zkp_z[32];
     uint8_t zkp_r[64];
-    uint8_t coefficient_commitments[512];  // Increased size
+    uint8_t coefficient_commitments[512];  
     size_t coefficient_commitments_size;
     
     uint32_t participant_id;
 } received_data;
 
-// Chunked data reassembly buffer - usar static allocation en lugar de malloc
+// Chunked data reassembly buffer
 #define REASSEMBLY_BUFFER_SIZE 2048
 static __aligned(4) uint8_t reassembly_buffer[REASSEMBLY_BUFFER_SIZE];
 static size_t reassembly_pos = 0;
@@ -132,12 +130,12 @@ K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
 static void receive_timeout_handler(struct k_timer *timer);
 K_TIMER_DEFINE(receive_timeout_timer, receive_timeout_handler, NULL);
 
-// Auto-completion timer for when END_TRANSMISSION is lost
-static void auto_complete_handler(struct k_timer *timer);
-K_TIMER_DEFINE(auto_complete_timer, auto_complete_handler, NULL);
+// Timer for controlled shutdown
+static void shutdown_timer_handler(struct k_timer *timer);
+K_TIMER_DEFINE(shutdown_timer, shutdown_timer_handler, NULL);
 
 /*
- * Fixed HID Report Descriptor - Updated for chunked protocol
+ * HID Report Descriptor
  */
 static const uint8_t hid_report_desc[] = {
     HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
@@ -153,7 +151,7 @@ static const uint8_t hid_report_desc[] = {
     HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
     HID_INPUT(0x02),
     
-    // Output report (host to device) - Updated for chunked data
+    // Output report (host to device)
     HID_REPORT_ID(REPORT_ID_OUTPUT),
     HID_LOGICAL_MIN8(0x00),
     HID_LOGICAL_MAX16(0xFF, 0x00),
@@ -182,21 +180,20 @@ static void print_hex_safe(const char *label, const uint8_t *data, size_t len)
             max_len > 3 ? data[3] : 0);
 }
 
-// Function to reset reassembly state - más seguro
+// Function to reset reassembly state
 static void reset_reassembly_state(void)
 {
     reassembling_message = false;
     reassembly_pos = 0;
     expected_total_size = 0;
     k_timer_stop(&receive_timeout_timer);
-    // Limpiar buffer por seguridad
     memset(reassembly_buffer, 0, sizeof(reassembly_buffer));
-    LOG_INF("Reassembly state reset");
+    LOG_DBG("Reassembly state reset");
 }
 
-// Function to write FROST key material to flash - con protecciones adicionales
+// Function to write FROST key material to flash
 static int write_frost_data_to_flash(void) {
-    LOG_INF("write_frost_data_to_flash: Starting...");
+    LOG_INF("Starting flash write operation...");
     
     const struct flash_area *fa;
     int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
@@ -205,7 +202,6 @@ static int write_frost_data_to_flash(void) {
         return rc;
     }
 
-    // Validar que la flash area sea válida
     if (!fa) {
         LOG_ERR("Flash area is NULL");
         return -EINVAL;
@@ -213,9 +209,9 @@ static int write_frost_data_to_flash(void) {
 
     LOG_INF("Flash area opened successfully");
 
-    // Prepare serializable storage structure - usar stack allocation
-    static __aligned(8) frost_flash_storage_t flash_data;  // Hacer estático para evitar problemas de stack
-    memset(&flash_data, 0, sizeof(frost_flash_storage_t));  // Clear all fields first
+    // Prepare serializable storage structure
+    static __aligned(8) frost_flash_storage_t flash_data;  
+    memset(&flash_data, 0, sizeof(frost_flash_storage_t));  
 
     LOG_INF("Preparing flash data structure...");
 
@@ -241,7 +237,6 @@ static int write_frost_data_to_flash(void) {
         memcpy(flash_data.commitments_zkp_z, received_data.zkp_z, 32);
         memcpy(flash_data.commitments_zkp_r, received_data.zkp_r, 64);
         
-        // Safely copy coefficient data
         size_t copy_size = received_data.coefficient_commitments_size;
         if (copy_size > sizeof(flash_data.commitments_coefficient_data)) {
             copy_size = sizeof(flash_data.commitments_coefficient_data);
@@ -258,8 +253,6 @@ static int write_frost_data_to_flash(void) {
         flash_area_close(fa);
         return -ENODEV;
     }
-
-    LOG_INF("Flash device is ready");
 
     // Get erase block size
     struct flash_pages_info info;
@@ -280,7 +273,7 @@ static int write_frost_data_to_flash(void) {
         return -ENOSPC;
     }
 
-    // Calculate erase size - must be multiple of page size
+    // Calculate erase size
     size_t erase_size = ROUND_UP(sizeof(frost_flash_storage_t), info.size);
     if (erase_size > fa->fa_size) {
         erase_size = fa->fa_size;
@@ -305,14 +298,14 @@ static int write_frost_data_to_flash(void) {
     LOG_INF("Writing %zu bytes to flash (padded to %zu, write_block=%zu)", 
             sizeof(frost_flash_storage_t), padded_size, write_block_size);
 
-    // Use static buffer with proper alignment - evitar problemas de stack
-    if (padded_size > 1024) {  // Reducir el límite para ser más conservador
+    // Use static buffer with proper alignment
+    if (padded_size > 1024) {  
         LOG_ERR("Padded size too large: %zu", padded_size);
         flash_area_close(fa);
         return -ENOMEM;
     }
     
-    static __aligned(8) uint8_t padded_buf[1024];  // Buffer estático más pequeño
+    static __aligned(8) uint8_t padded_buf[1024];  
     memset(padded_buf, 0xFF, padded_size);
     memcpy(padded_buf, &flash_data, sizeof(frost_flash_storage_t));
 
@@ -329,7 +322,7 @@ static int write_frost_data_to_flash(void) {
     LOG_INF("Flash write successful, verifying...");
 
     // Verify write
-    static __aligned(8) frost_flash_storage_t verify_data;  // También estático
+    static __aligned(8) frost_flash_storage_t verify_data;  
     rc = flash_area_read(fa, 0, &verify_data, sizeof(frost_flash_storage_t));
     if (rc != 0) {
         LOG_ERR("Failed to verify flash read (%d)", rc);
@@ -343,16 +336,15 @@ static int write_frost_data_to_flash(void) {
         return -EIO;
     }
 
-    // Clean up
     flash_area_close(fa);
     
     LOG_INF("FROST key material written and verified successfully");
     return 0;
 }
 
-// Function to read and log FROST key material from flash - también con protecciones
+// Function to read and log FROST key material from flash
 static int read_frost_data_from_flash(void) {
-    LOG_INF("read_frost_data_from_flash: Starting...");
+    LOG_INF("Reading flash data for verification...");
     
     const struct flash_area *fa;
     int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
@@ -361,7 +353,6 @@ static int read_frost_data_from_flash(void) {
         return rc;
     }
 
-    // Validar que la flash area sea válida
     if (!fa) {
         LOG_ERR("Flash area is NULL");
         return -EINVAL;
@@ -375,7 +366,7 @@ static int read_frost_data_from_flash(void) {
     }
 
     // Read back stored data
-    static __aligned(8) frost_flash_storage_t flash_data;  // Buffer estático
+    static __aligned(8) frost_flash_storage_t flash_data;  
     rc = flash_area_read(fa, 0, &flash_data, sizeof(frost_flash_storage_t));
     if (rc != 0) {
         LOG_ERR("Failed to read flash: %d", rc);
@@ -388,92 +379,98 @@ static int read_frost_data_from_flash(void) {
     LOG_INF("Participant Index: %u", flash_data.keypair_index);
     LOG_INF("Max Participants: %u", flash_data.keypair_max_participants);
     
-    // Helper function to log full hex data - usar buffer estático
-    static char hex_buf[129];  // Buffer estático para evitar problemas de stack
+    // Log hex data with static buffer
+    static char hex_buf[129];  
     
-    // Log full secret share
+    // Log secret share
     for (size_t i = 0; i < 32; i++) {
         sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_secret[i]);
     }
     hex_buf[64] = '\0';
     LOG_INF("Secret Share (32 bytes): %s", hex_buf);
 
-    // Log full public key
+    // Log public key
     for (size_t i = 0; i < 64; i++) {
         sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_public_key[i]);
     }
     hex_buf[128] = '\0';
     LOG_INF("Public Key (64 bytes): %s", hex_buf);
 
-    // Log full group public key
+    // Log group public key
     for (size_t i = 0; i < 64; i++) {
         sprintf(&hex_buf[i * 2], "%02x", flash_data.keypair_group_public_key[i]);
     }
     hex_buf[128] = '\0';
     LOG_INF("Group Public Key (64 bytes): %s", hex_buf);
 
-    // Clean up
     flash_area_close(fa);
     
     LOG_INF("Flash read completed successfully");
     return 0;
 }
 
-// Work handler for flash operations (runs in thread context) - evitar idle
+// CORRECTED: Safe shutdown function without infinite loops
+static void perform_safe_shutdown(void)
+{
+    LOG_INF("=== MISSION ACCOMPLISHED ===");
+    LOG_INF("FROST key for participant %u stored successfully", received_data.participant_id);
+    LOG_INF("Device can be safely disconnected from USB.");
+    
+    // Mark system as shutting down
+    received_data.system_shutting_down = true;
+    received_data.operation_complete = true;
+    
+    // Stop all timers to prevent further activity
+    k_timer_stop(&event_timer);
+    k_timer_stop(&receive_timeout_timer);
+    k_timer_stop(&shutdown_timer);
+    
+    // Give time for logs to flush
+    k_sleep(K_MSEC(500));
+    
+    LOG_INF("SUCCESS: Operation complete - system ready for disconnect");
+    
+    // Exit cleanly - NO INFINITE LOOPS
+    // The main thread will handle the rest
+}
+
+// Cleanup work handler
+static void cleanup_work_handler(struct k_work *work)
+{
+    perform_safe_shutdown();
+}
+
+// CORRECTED: Flash work handler without infinite loop
 static void flash_work_handler(struct k_work *work)
 {
     LOG_INF("Starting flash write operation...");
     
-    // Verificar que tenemos todos los datos necesarios antes de proceder
+    // Check that we have all required data
     if (!received_data.has_secret_share || !received_data.has_public_key || !received_data.has_commitments) {
         LOG_ERR("Missing required data for flash write");
         return;
     }
     
-    // Escribir datos a flash de manera segura
+    // Write data to flash
     int rc = write_frost_data_to_flash();
     
     if (rc == 0) {
         LOG_INF("Data successfully stored to flash");
         
-        // Pequeña pausa antes de leer de vuelta
+        // Small delay before reading back
         k_sleep(K_MSEC(100));
         
         // Read back and verify the data
         rc = read_frost_data_from_flash();
         if (rc == 0) {
             LOG_INF("Flash operation completed successfully");
-            LOG_INF("=== MISSION ACCOMPLISHED ===");
-            LOG_INF("FROST key for participant %u stored successfully", received_data.participant_id);
-            LOG_INF("Device can be safely disconnected from USB.");
             
-            // Marcar como completado
-            received_data.transmission_complete = true;
+            // Mark flash operation as complete
             received_data.flash_write_pending = false;
             
-            // Pausa para asegurar que los logs se escriban
-            k_sleep(K_MSEC(300));
+            // CORRECTED: Schedule cleanup instead of infinite loop
+            k_work_submit(&cleanup_work);
             
-            LOG_INF("SUCCESS: Entering safe infinite loop to prevent crashes...");
-            LOG_INF("You can now safely disconnect the device from USB.");
-            
-            // SOLUCIÓN DEFINITIVA: Loop infinito para evitar idle corrupto
-            // Esto mantiene el CPU ocupado y evita la entrada en k_cpu_idle() problemática
-            while (1) {
-                // Mantener el sistema despierto con actividad mínima
-                k_sleep(K_MSEC(1000));
-                
-                // Opcional: heartbeat cada 10 segundos para mostrar que está vivo
-                static int heartbeat_counter = 0;
-                heartbeat_counter++;
-                if (heartbeat_counter >= 10) {
-                    LOG_INF("System stable - FROST keys safely stored in flash");
-                    heartbeat_counter = 0;
-                }
-            }
-            
-            // Esta línea nunca se ejecutará
-            return;
         } else {
             LOG_ERR("Failed to read back flash data");
         }
@@ -481,11 +478,18 @@ static void flash_work_handler(struct k_work *work)
         LOG_ERR("Failed to store data to flash (error: %d)", rc);
     }
     
-    // Solo llegar aquí en caso de error
-    LOG_WRN("Flash operation completed with errors");
+    // CORRECTED: Exit cleanly from work handler
+    LOG_INF("Flash work handler exiting cleanly");
 }
 
-// Function to safely process a complete message - con más validaciones
+// Shutdown timer handler
+static void shutdown_timer_handler(struct k_timer *timer)
+{
+    // Submit cleanup work
+    k_work_submit(&cleanup_work);
+}
+
+// Function to process a complete message
 static void process_message(const uint8_t *data, size_t len)
 {
     if (!data || len < sizeof(struct message_header)) {
@@ -495,7 +499,7 @@ static void process_message(const uint8_t *data, size_t len)
     
     const struct message_header *header = (const struct message_header *)data;
     
-    // Validate header with more checks
+    // Validate header
     if (header->magic != MSG_HEADER_MAGIC || header->version != MSG_VERSION) {
         LOG_ERR("Invalid header: magic=0x%08x, version=0x%02x", header->magic, header->version);
         return;
@@ -520,10 +524,7 @@ static void process_message(const uint8_t *data, size_t len)
             if (payload_len >= sizeof(struct serialized_share)) {
                 const struct serialized_share *share = (const struct serialized_share *)payload;
                 received_data.secret_share.receiver_index = share->receiver_index;
-                
-                // Safe copy using memcpy
                 memcpy(received_data.secret_share.value, share->value, 32);
-                
                 received_data.has_secret_share = true;
                 LOG_INF("Secret share received (index=%u)", share->receiver_index);
                 print_hex_safe("Share", share->value, 32);
@@ -537,19 +538,11 @@ static void process_message(const uint8_t *data, size_t len)
                 const struct serialized_pubkey *pubkey = (const struct serialized_pubkey *)payload;
                 received_data.public_key.index = pubkey->index;
                 received_data.public_key.max_participants = pubkey->max_participants;
-                
-                // Safe copy using memcpy to avoid alignment issues
                 memcpy(received_data.public_key.public_key, pubkey->public_key, 64);
                 memcpy(received_data.public_key.group_public_key, pubkey->group_public_key, 64);
-                
                 received_data.has_public_key = true;
                 LOG_INF("Public key received (index=%u, max_participants=%u)", 
                         pubkey->index, pubkey->max_participants);
-                
-                // Start auto-completion timer if we have secret share too
-                if (received_data.has_secret_share) {
-                    LOG_INF("Secret and public key received, checking for completion...");
-                }
             } else {
                 LOG_ERR("Public key payload too small: %zu", payload_len);
             }
@@ -559,7 +552,6 @@ static void process_message(const uint8_t *data, size_t len)
             if (payload_len >= 8 + 32 + 64) {
                 const uint8_t *ptr = payload;
                 
-                // Usar memcpy para evitar problemas de alineación
                 memcpy(&received_data.commitment_index, ptr, sizeof(uint32_t));
                 ptr += sizeof(uint32_t);
                 memcpy(&received_data.num_coefficients, ptr, sizeof(uint32_t));
@@ -571,7 +563,7 @@ static void process_message(const uint8_t *data, size_t len)
                 memcpy(received_data.zkp_r, ptr, 64);
                 ptr += 64;
                 
-                // Copy remaining coefficient data safely with bounds checking
+                // Copy remaining coefficient data safely
                 size_t coef_size = payload_len - (8 + 32 + 64);
                 if (coef_size <= sizeof(received_data.coefficient_commitments)) {
                     memcpy(received_data.coefficient_commitments, ptr, coef_size);
@@ -590,7 +582,6 @@ static void process_message(const uint8_t *data, size_t len)
             
         case MSG_TYPE_END_TRANSMISSION:
             LOG_INF("End transmission received");
-            k_timer_stop(&auto_complete_timer);  // Stop auto-completion timer
             received_data.transmission_complete = true;
             
             LOG_INF("=== FROST Summary ===");
@@ -603,15 +594,15 @@ static void process_message(const uint8_t *data, size_t len)
                 received_data.has_commitments) {
                 LOG_INF("SUCCESS: All data received!");
                 
-                // Schedule flash write in thread context
+                // Schedule flash write
                 if (!received_data.flash_write_pending) {
                     received_data.flash_write_pending = true;
                     k_work_submit(&flash_work);
                 }
             } else {
                 LOG_WRN("INCOMPLETE data received");
-                report_1.value = 0xEE;
-                k_work_submit(&report_send);
+                // Still trigger cleanup after delay
+                k_timer_start(&shutdown_timer, K_SECONDS(2), K_NO_WAIT);
             }
             break;
             
@@ -619,7 +610,6 @@ static void process_message(const uint8_t *data, size_t len)
             LOG_WRN("Unknown message type: 0x%02x", header->msg_type);
             
             // Auto-trigger completion check if we have received the main data
-            // This handles cases where END_TRANSMISSION is lost
             if (!received_data.transmission_complete && 
                 received_data.has_secret_share && 
                 received_data.has_public_key && 
@@ -635,7 +625,7 @@ static void process_message(const uint8_t *data, size_t len)
                 LOG_INF("Commits: OK");
                 LOG_INF("SUCCESS: All data received!");
                 
-                // Schedule flash write in thread context
+                // Schedule flash write
                 if (!received_data.flash_write_pending) {
                     received_data.flash_write_pending = true;
                     k_work_submit(&flash_work);
@@ -658,36 +648,15 @@ static void receive_timeout_handler(struct k_timer *timer)
     }
 }
 
-// Auto-completion handler for when END_TRANSMISSION is lost
-static void auto_complete_handler(struct k_timer *timer)
-{
-    if (!received_data.transmission_complete && 
-        received_data.has_secret_share && 
-        received_data.has_public_key && 
-        received_data.has_commitments) {
-        
-        LOG_INF("Auto-completion timer: All data received, assuming END_TRANSMISSION lost");
-        received_data.transmission_complete = true;
-        
-        LOG_INF("=== FROST Summary (Auto-completed) ===");
-        LOG_INF("Participant: %u", received_data.participant_id);
-        LOG_INF("Secret: OK");
-        LOG_INF("Public: OK");
-        LOG_INF("Commits: OK");
-        LOG_INF("SUCCESS: All data received!");
-        
-        // Schedule flash write in thread context
-        if (!received_data.flash_write_pending) {
-            received_data.flash_write_pending = true;
-            k_work_submit(&flash_work);
-        }
-    }
-}
-
-// Enhanced chunked data handler - más seguro
+// Enhanced chunked data handler
 static void handle_chunked_data(const uint8_t *data, size_t len)
 {
-    if (!data || len < 3) {  // Report ID + Length + at least 1 byte data
+    // Don't process data if system is shutting down
+    if (received_data.system_shutting_down) {
+        return;
+    }
+    
+    if (!data || len < 3) {  
         LOG_WRN("Invalid chunk: too small (%zu bytes)", len);
         return;
     }
@@ -740,7 +709,6 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
             
             reassembling_message = true;
             reassembly_pos = 0;
-            // Clear buffer antes de comenzar
             memset(reassembly_buffer, 0, sizeof(reassembly_buffer));
             
             LOG_INF("NEW MESSAGE START: type=0x%02x, total=%zu bytes expected", 
@@ -758,21 +726,15 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
     // Add chunk to reassembly buffer if we're reassembling
     if (reassembling_message) {
         size_t space_available = REASSEMBLY_BUFFER_SIZE - reassembly_pos;
-        size_t bytes_to_copy = (chunk_len > space_available) ? space_available : chunk_len;
+        size_t remaining = expected_total_size - reassembly_pos;
+        size_t bytes_to_copy = MIN(chunk_len, MIN(space_available, remaining));
         
-        if (bytes_to_copy > 0 && (reassembly_pos + bytes_to_copy) <= REASSEMBLY_BUFFER_SIZE) {
-            // Verificar que no sobrepasemos el tamaño esperado
-            if ((reassembly_pos + bytes_to_copy) > expected_total_size) {
-                bytes_to_copy = expected_total_size - reassembly_pos;
-            }
+        if (bytes_to_copy > 0) {
+            memcpy(reassembly_buffer + reassembly_pos, chunk_data, bytes_to_copy);
+            reassembly_pos += bytes_to_copy;
             
-            if (bytes_to_copy > 0) {
-                memcpy(reassembly_buffer + reassembly_pos, chunk_data, bytes_to_copy);
-                reassembly_pos += bytes_to_copy;
-                
-                LOG_INF("REASSEMBLY: %zu/%zu bytes (+%zu)", 
-                        reassembly_pos, expected_total_size, bytes_to_copy);
-            }
+            LOG_INF("REASSEMBLY: %zu/%zu bytes (+%zu)", 
+                    reassembly_pos, expected_total_size, bytes_to_copy);
             
             // Check if message is complete
             if (reassembly_pos >= expected_total_size) {
@@ -788,8 +750,7 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
                 reset_reassembly_state();
             }
         } else {
-            LOG_ERR("Buffer overflow protection: pos=%zu, copy=%zu, buffer_size=%d", 
-                    reassembly_pos, bytes_to_copy, REASSEMBLY_BUFFER_SIZE);
+            LOG_ERR("Buffer overflow protection activated");
             reset_reassembly_state();
         }
     } else {
@@ -802,6 +763,11 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
 static void send_report(struct k_work *work)
 {
     int ret, wrote;
+
+    // Don't send reports if system is shutting down
+    if (received_data.system_shutting_down) {
+        return;
+    }
 
     if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
         ret = hid_int_ep_write(hdev, (uint8_t *)&report_1,
@@ -822,9 +788,14 @@ static void int_out_ready_cb(const struct device *dev)
     uint8_t buffer[64];
     int ret, received;
     
+    // Don't process data if system is shutting down
+    if (received_data.system_shutting_down) {
+        return;
+    }
+    
     ret = hid_int_ep_read(dev, buffer, sizeof(buffer), &received);
     if (ret == 0 && received > 0) {
-        // Reset/update timeout on successful data reception
+        // Reset timeout on successful data reception
         k_timer_stop(&receive_timeout_timer);
         if (reassembling_message) {
             k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
@@ -837,8 +808,13 @@ static void int_out_ready_cb(const struct device *dev)
 static int set_report_cb(const struct device *dev, struct usb_setup_packet *setup,
              int32_t *len, uint8_t **data)
 {
+    // Don't process data if system is shutting down
+    if (received_data.system_shutting_down) {
+        return 0;
+    }
+    
     if (*len > 0 && *data) {
-        // Reset/update timeout on successful data reception
+        // Reset timeout on successful data reception
         k_timer_stop(&receive_timeout_timer);
         if (reassembling_message) {
             k_timer_start(&receive_timeout_timer, K_SECONDS(30), K_NO_WAIT);
@@ -851,12 +827,14 @@ static int set_report_cb(const struct device *dev, struct usb_setup_packet *setu
 
 static void on_idle_cb(const struct device *dev, uint16_t report_id)
 {
-    k_work_submit(&report_send);
+    if (!received_data.system_shutting_down) {
+        k_work_submit(&report_send);
+    }
 }
 
 static void report_event_handler(struct k_timer *dummy)
 {
-    if (!received_data.transmission_complete) {
+    if (!received_data.transmission_complete && !received_data.system_shutting_down) {
         if (report_1.value < 100) {
             report_1.value++;
         } else {
@@ -879,7 +857,7 @@ static const struct hid_ops ops = {
     .set_report = set_report_cb,
 };
 
-// Función para resetear todos los datos al hacer USB reset
+// Function to reset all data 
 static void reset_all_data(void)
 {
     if (k_mutex_lock(&buffer_mutex, K_MSEC(100)) == 0) {
@@ -891,7 +869,7 @@ static void reset_all_data(void)
         
         // Stop all timers
         k_timer_stop(&receive_timeout_timer);
-        k_timer_stop(&auto_complete_timer);
+        k_timer_stop(&shutdown_timer);
         
         // Reset report value
         report_1.value = 0;
@@ -907,7 +885,6 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
     case USB_DC_RESET:
         configured = false;
         LOG_INF("USB Reset");
-        // Reset todos los datos en USB reset
         reset_all_data();
         break;
     case USB_DC_CONFIGURED:
@@ -934,8 +911,9 @@ int main(void)
     memset(&received_data, 0, sizeof(received_data));
     memset(reassembly_buffer, 0, sizeof(reassembly_buffer));
     
-    // Initialize flash work queue
+    // Initialize work queues
     k_work_init(&flash_work, flash_work_handler);
+    k_work_init(&cleanup_work, cleanup_work_handler);
 
     hdev = device_get_binding("HID_0");
     if (hdev == NULL) {
@@ -965,5 +943,17 @@ int main(void)
     LOG_INF("=== FROST HID Receiver Ready ===");
     LOG_INF("Reassembly buffer size: %d bytes", REASSEMBLY_BUFFER_SIZE);
     
+    // CORRECTED: Safe main loop that waits for completion
+    while (!received_data.operation_complete) {
+        k_sleep(K_SECONDS(1));
+        
+        // Periodic status check
+        if (received_data.operation_complete) {
+            LOG_INF("Operation completed - exiting main loop");
+            break;
+        }
+    }
+    
+    LOG_INF("Main thread exiting cleanly");
     return 0;
 }

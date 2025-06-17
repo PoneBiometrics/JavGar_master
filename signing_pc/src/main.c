@@ -11,20 +11,17 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 
-#define N 3 // Number of participants
-#define T 2 // Threshold of needed participants
+#define N 3
+#define T 2
 
-// USB HID constants - MUST match receiver
 #define VENDOR_ID 0x2FE3   
 #define PRODUCT_ID 0x100   
 
-// Communication types
 typedef enum {
     COMM_TYPE_UART = 1,
     COMM_TYPE_USB_HID = 2
 } communication_type_t;
 
-// Communication handle wrapper
 typedef struct {
     communication_type_t type;
     union {
@@ -39,11 +36,9 @@ typedef struct {
     };
 } comm_handle_t;
 
-// Constants for message protocol
-#define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
+#define MSG_HEADER_MAGIC 0x46524F53
 #define MSG_VERSION 0x01
 
-// Message types for our protocol
 typedef enum {
     MSG_TYPE_NONCE_COMMITMENT = 0x04,  
     MSG_TYPE_ALL_NONCE_COMMITMENTS = 0x05,  
@@ -53,7 +48,6 @@ typedef enum {
     MSG_TYPE_SIGNATURE_SHARE = 0x08
 } message_type_t;
 
-// Header for each message in our protocol
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;        
@@ -64,16 +58,14 @@ typedef struct {
 } message_header_t;
 #pragma pack(pop)
 
-// Nonce commitment structure - EXACTLY matches secp256k1_frost_nonce_commitment
 #pragma pack(push, 1)
 typedef struct {
     uint32_t index;
-    uint8_t hiding[64];     // Full 64-byte point serialization
-    uint8_t binding[64];    // Full 64-byte point serialization
+    uint8_t hiding[64];
+    uint8_t binding[64];
 } serialized_nonce_commitment_t;
 #pragma pack(pop)
 
-// Signature share structure - EXACTLY matches secp256k1_frost_signature_share
 #pragma pack(push, 1)
 typedef struct {
     uint32_t index;
@@ -81,18 +73,16 @@ typedef struct {
 } serialized_signature_share_t;
 #pragma pack(pop)
 
-// Keypair structure for storing participant keys
 #pragma pack(push, 1)
 typedef struct {
     uint32_t index;
     uint32_t max_participants;
     uint8_t secret[32];
-    uint8_t public_key[64];      // Individual public key (FULL 64 bytes)
-    uint8_t group_public_key[64]; // Group public key (FULL 64 bytes)
+    uint8_t public_key[64];
+    uint8_t group_public_key[64];
 } serialized_keypair_t;
 #pragma pack(pop)
 
-// ================== ENHANCED DEBUGGING FUNCTIONS ==================
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
     for (size_t i = 0; i < len && i < 8; i++) {
@@ -121,14 +111,12 @@ void print_public_key_complete(const char *label, const unsigned char *key, size
     printf("\n");
 }
 
-// ✅ ENHANCED VERIFICATION: Verificar que los commitments son consistentes
 static void verify_commitment_consistency(const serialized_nonce_commitment_t* commitments, int num_commitments) {
     printf("\n🔍 === COMMITMENT CONSISTENCY VERIFICATION ===\n");
     
     for (int i = 0; i < num_commitments; i++) {
         printf("🔍 Participant %u commitment:\n", commitments[i].index);
         
-        // Verificar que no sea todo ceros
         bool hiding_zeros = true, binding_zeros = true;
         for (int j = 0; j < 64; j++) {
             if (commitments[i].hiding[j] != 0) hiding_zeros = false;
@@ -162,7 +150,6 @@ static void verify_commitment_consistency(const serialized_nonce_commitment_t* c
     printf("🔍 =====================================\n\n");
 }
 
-// ✅ OPTIMIZED AGGREGATION with enhanced debugging
 int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signature_shares,
                                            serialized_keypair_t* participant_keypairs,
                                            serialized_nonce_commitment_t* commitments,
@@ -178,10 +165,8 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
         return 0;
     }
     
-    // ✅ Enhanced verification
     verify_commitment_consistency(commitments, num_shares);
     
-    // ✅ Usar el participante con índice más bajo como agregador (más robusto)
     uint32_t aggregator_index = UINT32_MAX;
     int aggregator_pos = -1;
     
@@ -200,7 +185,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     
     printf("✅ Selected aggregator: Participant %u (lowest index)\n", aggregator_index);
     
-    // ✅ Reconstruir aggregator keypair
     secp256k1_frost_keypair aggregator_keypair;
     memset(&aggregator_keypair, 0, sizeof(secp256k1_frost_keypair));
     
@@ -217,7 +201,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     print_hex("   Public key (first 8 bytes)", aggregator_keypair.public_keys.public_key, 8);
     print_hex("   Group key (first 8 bytes)", aggregator_keypair.public_keys.group_public_key, 8);
     
-    // ✅ Crear arrays en ORDEN ASCENDENTE por índice de participante
     typedef struct {
         uint32_t participant_index;
         int signature_pos;
@@ -227,12 +210,10 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     
     participant_mapping_t mappings[num_shares];
     
-    // Crear tabla de mapeo
     for (int i = 0; i < num_shares; i++) {
         mappings[i].participant_index = signature_shares[i].index;
         mappings[i].signature_pos = i;
         
-        // Encontrar posiciones correspondientes
         mappings[i].keypair_pos = -1;
         mappings[i].commitment_pos = -1;
         
@@ -252,7 +233,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
         }
     }
     
-    // Ordenar mappings por índice de participante (orden ascendente)
     for (int i = 0; i < num_shares - 1; i++) {
         for (int j = i + 1; j < num_shares; j++) {
             if (mappings[i].participant_index > mappings[j].participant_index) {
@@ -269,7 +249,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     }
     printf("\n");
     
-    // ✅ Construir arrays en orden ordenado
     secp256k1_frost_pubkey public_keys[num_shares];
     secp256k1_frost_nonce_commitment signing_commitments[num_shares];
     secp256k1_frost_signature_share frost_signature_shares[num_shares];
@@ -277,17 +256,14 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     for (int i = 0; i < num_shares; i++) {
         participant_mapping_t* m = &mappings[i];
         
-        // Construir array de signature shares
         frost_signature_shares[i].index = signature_shares[m->signature_pos].index;
         memcpy(frost_signature_shares[i].response, signature_shares[m->signature_pos].response, 32);
         
-        // Construir array de public keys
         public_keys[i].index = participant_keypairs[m->keypair_pos].index;
         public_keys[i].max_participants = participant_keypairs[m->keypair_pos].max_participants;
         memcpy(public_keys[i].public_key, participant_keypairs[m->keypair_pos].public_key, 64);
         memcpy(public_keys[i].group_public_key, participant_keypairs[m->keypair_pos].group_public_key, 64);
         
-        // ✅ Construir array de signing commitments en ORDEN EXACTO
         signing_commitments[i].index = commitments[m->commitment_pos].index;
         memcpy(signing_commitments[i].hiding, commitments[m->commitment_pos].hiding, 64);
         memcpy(signing_commitments[i].binding, commitments[m->commitment_pos].binding, 64);
@@ -304,7 +280,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
                signing_commitments[i].binding[2], signing_commitments[i].binding[3]);
     }
     
-    // ✅ Verificar message hash
     printf("\n🔍 Message hash verification:\n");
     unsigned char expected_msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
     unsigned char expected_hash[32];
@@ -323,7 +298,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     }
     printf("✅ Message hash verified correctly\n");
     
-    // ✅ Intentar agregación con datos ordenados
     printf("\n🔗 Attempting signature aggregation with persistence-aware data...\n");
     printf("📋 Using %d signature shares from persistent nonces\n", num_shares);
     
@@ -336,7 +310,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
         printf("🎉 *** SIGNATURE AGGREGATION SUCCESS! ***\n");
         printf("✅ Persistent nonces worked correctly!\n");
         
-        // Verificar la firma agregada
         int is_signature_valid = secp256k1_frost_verify(ctx, final_signature, msg_hash, 
                                                         &aggregator_keypair.public_keys);
         
@@ -360,7 +333,6 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
         printf("❌ *** SIGNATURE AGGREGATION FAILED ***\n");
         printf("❌ This may indicate nonce persistence issues\n");
         
-        // Enhanced debugging para persistencia
         printf("\n🔍 PERSISTENCE DEBUG INFORMATION:\n");
         printf("Number of participants: %d\n", num_shares);
         printf("Aggregator index: %u\n", aggregator_keypair.public_keys.index);
@@ -396,17 +368,14 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     }
 }
 
-// ✅ ENHANCED COMMITMENT SORTING con verificación
 void send_commitments_in_consistent_order(serialized_nonce_commitment_t* commitments, int num_commitments) {
     printf("\n🔄 === ENSURING COMMITMENT CONSISTENCY ===\n");
     
-    // Verificar antes del ordenamiento
     printf("Before sorting:\n");
     for (int i = 0; i < num_commitments; i++) {
         printf("  Position %d: Participant %u\n", i, commitments[i].index);
     }
     
-    // Ordenar por índice de participante
     for (int i = 0; i < num_commitments - 1; i++) {
         for (int j = i + 1; j < num_commitments; j++) {
             if (commitments[i].index > commitments[j].index) {
@@ -426,7 +395,6 @@ void send_commitments_in_consistent_order(serialized_nonce_commitment_t* commitm
     printf("✅ This order will be preserved across all devices\n");
 }
 
-// ================== HID HELPER FUNCTIONS ==================
 comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
     comm_handle_t comm = {0};
     GUID hid_guid;
@@ -540,7 +508,7 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
             return FALSE;
         }
         
-        report[0] = 0x02; // Report ID
+        report[0] = 0x02;
         size_t available_space = comm->output_report_length - 2;
         size_t remaining = len - bytes_sent;
         size_t chunk_size = (available_space < remaining) ? available_space : remaining;
@@ -559,7 +527,7 @@ BOOL send_hid_data(comm_handle_t* comm, const void* data, size_t len) {
         
         free(report);
         bytes_sent += chunk_size;
-        Sleep(200); // Delay between chunks
+        Sleep(200);
     }
     
     return TRUE;
@@ -590,7 +558,6 @@ BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len,
                     
                     printf("Received chunk: %u bytes (total: %zu)\n", chunk_len, *total_received);
                     
-                    // Check if this looks like a complete message
                     if (*total_received >= sizeof(message_header_t)) {
                         message_header_t* header = (message_header_t*)recv_buffer;
                         if (header->magic == MSG_HEADER_MAGIC) {
@@ -620,7 +587,6 @@ BOOL receive_hid_data_chunked(comm_handle_t* comm, void* buffer, size_t max_len,
     return (*total_received > 0);
 }
 
-// ================== GENERIC COMMUNICATION FUNCTIONS ==================
 BOOL send_data(comm_handle_t* comm, const void* data, size_t len) {
     switch (comm->type) {
         case COMM_TYPE_UART: {
@@ -652,7 +618,6 @@ BOOL receive_data(comm_handle_t* comm, void* buffer, size_t max_len, size_t* byt
     }
 }
 
-// ================== MESSAGE FUNCTIONS ==================
 BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant, 
                   const void* payload, uint16_t payload_len) {
     message_header_t header;
@@ -717,7 +682,6 @@ BOOL receive_complete_message(comm_handle_t* comm, uint8_t* buffer, size_t max_l
     return TRUE;
 }
 
-// ================== SERIAL PORT SETUP ==================
 HANDLE setup_uart_port(const char *port_name) {
     HANDLE hSerial = CreateFile(port_name,
         GENERIC_READ | GENERIC_WRITE,
@@ -815,7 +779,6 @@ void close_communication(comm_handle_t* comm) {
     memset(comm, 0, sizeof(comm_handle_t));
 }
 
-// ================== FROST FUNCTIONS ==================
 void compute_message_hash_verified(unsigned char* msg_hash, const unsigned char* msg, size_t msg_len) {
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '_', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
@@ -842,7 +805,6 @@ void compute_message_hash_verified(unsigned char* msg_hash, const unsigned char*
     secp256k1_context_destroy(ctx);
 }
 
-// ================== MAIN PROGRAM ==================
 int main(void) {
     printf("=== FROST Signature Coordinator (NONCE PERSISTENCE SUPPORT) ===\n");
     printf("💾 Enhanced to work with persistent nonces across device restarts\n\n");
@@ -854,14 +816,12 @@ int main(void) {
     int shares_received = 0;
     uint8_t receive_buffer[1024];
     
-    // Message to sign
     unsigned char msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
     unsigned char msg_hash[32];
     
     printf("Computing message hash...\n");
     compute_message_hash_verified(msg_hash, msg, sizeof(msg));
     
-    // Phase 1: Collect nonce commitments and keypairs
     for (int i = 0; i < T; i++) {
         printf("\n=== Processing Participant %d (Nonce Commitment Collection) ===\n", i+1);
         
@@ -871,7 +831,6 @@ int main(void) {
             continue;
         }
         
-        // Send READY signal
         printf("💾 Sending READY signal to participant %d...\n", i+1);
         printf("💾 This will trigger nonce generation and persistence on device\n");
         if (!send_message(&comm, MSG_TYPE_READY, i+1, NULL, 0)) {
@@ -880,7 +839,6 @@ int main(void) {
             continue;
         }
         
-        // Wait for response
         printf("⏳ Waiting for nonce commitment from participant %d...\n", i+1);
         printf("💾 Device will generate fresh nonce and persist to flash\n");
         
@@ -889,13 +847,10 @@ int main(void) {
         
         if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), &header, &payload)) {
             if (header->msg_type == MSG_TYPE_NONCE_COMMITMENT) {
-                // We expect both nonce commitment AND keypair in this message
                 uint8_t* payload_data = (uint8_t*)payload;
                 
-                // First comes the nonce commitment
                 memcpy(&commitments[commitments_received], payload_data, sizeof(serialized_nonce_commitment_t));
                 
-                // Then comes the keypair
                 memcpy(&participant_keypairs[commitments_received], 
                        payload_data + sizeof(serialized_nonce_commitment_t), 
                        sizeof(serialized_keypair_t));
@@ -940,11 +895,9 @@ int main(void) {
         return 1;
     }
     
-    // ✅ CRITICAL: Sort commitments for consistency
     printf("\n=== ENSURING COMMITMENT CONSISTENCY FOR PERSISTENCE ===\n");
     send_commitments_in_consistent_order(commitments, commitments_received);
     
-    // Display summary
     printf("\n=== FROST PERSISTENT NONCE COMMITMENT COLLECTION COMPLETE ===\n");
     printf("💾 Collected %d persistent nonce commitments:\n", commitments_received);
     for (int i = 0; i < commitments_received; i++) {
@@ -958,7 +911,6 @@ int main(void) {
         print_hex("  Binding (first 8 bytes)", commitments[i].binding, 64);
     }
     
-    // Phase 2: Send signing data and collect signature shares
     printf("\n=== Sending Signing Data and Collecting Signature Shares ===\n");
     printf("💾 Devices will use original nonces from flash persistence\n");
     
@@ -972,7 +924,6 @@ int main(void) {
             continue;
         }
         
-        // Prepare payload: [msg_hash][num_commitments][commitments...]
         uint16_t payload_len = 32 + 4 + T * sizeof(serialized_nonce_commitment_t);
         uint8_t* payload = (uint8_t*)malloc(payload_len);
         if (!payload) {
@@ -980,14 +931,10 @@ int main(void) {
             continue;
         }
         
-        // Copy message hash
         memcpy(payload, msg_hash, 32);
-        // Copy number of commitments
         *(uint32_t*)(payload + 32) = T;
-        // Copy commitments (already sorted)
         memcpy(payload + 32 + 4, commitments, T * sizeof(serialized_nonce_commitment_t));
         
-        // Send signing message
         printf("💾 Sending signing data to participant %u...\n", participant_index);
         printf("💾 Device will load original nonce from flash persistence\n");
         
@@ -1020,14 +967,13 @@ int main(void) {
         
         free(payload);
         
-        // Wait for signature share
         printf("⏳ Waiting for signature share from participant %u...\n", participant_index);
         printf("💾 Expecting signature computed with original persisted nonce\n");
         
         message_header_t* header;
         void* payload_response;
         DWORD start_time = GetTickCount();
-        DWORD timeout_ms = 30000; // 30 second timeout
+        DWORD timeout_ms = 30000;
         BOOL received_share = FALSE;
         
         while (!received_share && (GetTickCount() - start_time) < timeout_ms) {
@@ -1036,7 +982,6 @@ int main(void) {
                 if (header->msg_type == MSG_TYPE_SIGNATURE_SHARE && 
                     header->payload_len == sizeof(serialized_signature_share_t)) {
                     
-                    // Store the signature share
                     serialized_signature_share_t* sig_share = (serialized_signature_share_t*)payload_response;
                     memcpy(&signature_shares[shares_received], sig_share, sizeof(serialized_signature_share_t));
                     
@@ -1096,11 +1041,9 @@ int main(void) {
         
         printf("🔗 Proceeding to aggregate signature shares from persistent nonces...\n");
         
-        // ================== SIGNATURE AGGREGATION ==================
         unsigned char final_signature[64];
         memset(final_signature, 0, sizeof(final_signature));
         
-        // ✅ Use the ENHANCED aggregation function for persistence
         int aggregation_result = aggregate_and_verify_signature_ENHANCED(signature_shares, 
                                                                         participant_keypairs,
                                                                         commitments,
@@ -1132,7 +1075,6 @@ int main(void) {
             }
             printf("\n");
             
-            // Show final complete key information
             printf("\n=== FINAL KEY INFORMATION ===\n");
             print_public_key_complete("Group Public Key (Complete)", 
                                     participant_keypairs[0].group_public_key, 64);

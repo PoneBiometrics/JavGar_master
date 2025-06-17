@@ -12,20 +12,17 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 
-#define N 3 // Number of participants
-#define T 2 // Threshold of needed participants
+#define N 3
+#define T 2
 
-// USB HID constants
 #define VENDOR_ID 0x2FE3   
 #define PRODUCT_ID 0x100   
 
-// Communication types
 typedef enum {
     COMM_TYPE_UART = 1,
     COMM_TYPE_USB_HID = 2
 } communication_type_t;
 
-// Communication handle wrapper
 typedef struct {
     communication_type_t type;
     union {
@@ -39,11 +36,9 @@ typedef struct {
     };
 } comm_handle_t;
 
-// Constants for message protocol - MUST match receiver
-#define MSG_HEADER_MAGIC 0x46524F53 // "FROS" as hex
+#define MSG_HEADER_MAGIC 0x46524F53
 #define MSG_VERSION 0x01
 
-// Message types for our protocol
 typedef enum {
     MSG_TYPE_SECRET_SHARE = 0x01,
     MSG_TYPE_PUBLIC_KEY = 0x02,
@@ -51,18 +46,16 @@ typedef enum {
     MSG_TYPE_END_TRANSMISSION = 0xFF
 } message_type_t;
 
-// Header for each message in our protocol
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;        // Magic number to identify our protocol
-    uint8_t version;       // Protocol version
-    uint8_t msg_type;      // Type of message
-    uint16_t payload_len;  // Length of payload following the header
-    uint32_t participant;  // Participant ID (1-based)
+    uint32_t magic;
+    uint8_t version;
+    uint8_t msg_type;
+    uint16_t payload_len;
+    uint32_t participant;
 } message_header_t;
 #pragma pack(pop)
 
-// Corrected structures to match the example format
 #pragma pack(push, 1)
 typedef struct {
     uint32_t receiver_index;
@@ -74,12 +67,11 @@ typedef struct {
 typedef struct {
     uint32_t index;
     uint32_t max_participants;
-    uint8_t public_key[64];      // 64 bytes like in example
-    uint8_t group_public_key[64]; // 64 bytes like in example
+    uint8_t public_key[64];
+    uint8_t group_public_key[64];
 } serialized_pubkey_t;
 #pragma pack(pop)
 
-// Helper function to print hex data
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
     for (size_t i = 0; i < len; i++) {
@@ -88,9 +80,6 @@ void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("\n");
 }
 
-// fill_random is provided by examples_util.h - no need to implement
-
-// Enhanced USB HID helper functions
 comm_handle_t find_hid_device(USHORT vendor_id, USHORT product_id) {
     comm_handle_t comm = {0};
     GUID hid_guid;
@@ -448,7 +437,6 @@ void close_communication(comm_handle_t* comm) {
 int main(void) {
     printf("=== Starting FROST Key Generation and Distribution ===\n\n");
 
-    /* Initialization */
     secp256k1_context *ctx;
     secp256k1_frost_vss_commitments *dealer_commitments;
     secp256k1_frost_keygen_secret_share shares_by_participant[N];
@@ -456,7 +444,6 @@ int main(void) {
     secp256k1_frost_pubkey public_keys[N];
     int return_val;
 
-    /* Create context */
     printf("Initializing context...\n");
     ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (!ctx) {
@@ -465,7 +452,6 @@ int main(void) {
     }
     printf("Context created successfully.\n");
 
-    /* Key generation */
     printf("\nGenerating dealer commitments...\n");
     dealer_commitments = secp256k1_frost_vss_commitments_create(T);
     if (!dealer_commitments) {
@@ -492,12 +478,10 @@ int main(void) {
     }
     printf("Key generation succeeded.\n");
 
-    /* Extract public keys from keypairs */
     for (int i = 0; i < N; i++) {
         secp256k1_frost_pubkey_from_keypair(&public_keys[i], &keypairs[i]);
     }
 
-    /* Print keys and shares (for debugging) */
     printf("\n=== Participants ===\n\n");
     for (int i = 0; i < N; i++) {
         printf("Participant %d:\n", i + 1);
@@ -508,7 +492,6 @@ int main(void) {
         printf("\n");
     }
 
-    /* Key distribution */
     printf("\n=== Starting Key Distribution ===\n\n");
     
     for (int i = 0; i < N; i++) {
@@ -527,7 +510,7 @@ int main(void) {
             continue;
         }
         printf("Secret share sent successfully. Waiting...\n");
-        Sleep(2000);  // Increased delay
+        Sleep(2000);
         
         if (!send_public_key(&comm, i + 1, &public_keys[i])) {
             printf("Failed to send public key to participant %d.\n", i + 1);
@@ -535,7 +518,7 @@ int main(void) {
             continue;
         }
         printf("Public key sent successfully. Waiting...\n");
-        Sleep(2000);  // Increased delay
+        Sleep(2000);
         
         if (!send_commitments(&comm, i + 1, dealer_commitments)) {
             printf("Failed to send commitments to participant %d.\n", i + 1);
@@ -543,9 +526,8 @@ int main(void) {
             continue;
         }
         printf("Commitments sent successfully. Waiting before end transmission...\n");
-        Sleep(3000);  // Longer delay before end transmission
+        Sleep(3000);
         
-        // Try sending end transmission multiple times if it fails
         int retry_count = 0;
         bool end_sent = false;
         while (retry_count < 3 && !end_sent) {
@@ -556,7 +538,7 @@ int main(void) {
             } else {
                 printf("End transmission failed (attempt %d/3). Retrying...\n", retry_count + 1);
                 retry_count++;
-                Sleep(1000);  // Wait before retry
+                Sleep(1000);
             }
         }
         
@@ -572,7 +554,6 @@ int main(void) {
     
     printf("\n=== Key Distribution Completed ===\n");
     
-    /* Cleanup */
     secp256k1_frost_vss_commitments_destroy(dealer_commitments);
     secp256k1_context_destroy(ctx);
     return 0;

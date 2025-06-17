@@ -16,10 +16,8 @@
 #define LOG_LEVEL LOG_LEVEL_INF
 LOG_MODULE_REGISTER(frost_hid_device);
 
-// Flash storage partition
 #define STORAGE_PARTITION storage_partition
 
-// HID configuration
 #define REPORT_ID_INPUT  0x01
 #define REPORT_ID_OUTPUT 0x02
 #define HID_EP_BUSY_FLAG 0
@@ -27,8 +25,7 @@ LOG_MODULE_REGISTER(frost_hid_device);
 #define CHUNK_SIZE       61
 #define CHUNK_DELAY_MS   50
 
-// Message protocol constants
-#define MSG_HEADER_MAGIC 0x46524F53 // "FROS"
+#define MSG_HEADER_MAGIC 0x46524F53
 #define MSG_VERSION      0x01
 
 typedef enum {
@@ -66,27 +63,23 @@ typedef struct {
     uint8_t group_public_key[64];
 } __packed serialized_keypair_t;
 
-// ✅ EXTENDED FLASH STORAGE - Mantiene datos existentes + nonce persistence
 typedef struct {
-    // === DATOS EXISTENTES (mantener compatibilidad) ===
     uint32_t keypair_index;
     uint32_t keypair_max_participants;
     uint8_t keypair_secret[32];
     uint8_t keypair_public_key[64];
     uint8_t keypair_group_public_key[64];
     
-    // === NUEVOS DATOS PARA NONCE PERSISTENCE ===
-    uint32_t nonce_session_id;          // ID de sesión para replay protection
-    uint8_t nonce_hiding_secret[32];    // Secreto hiding original del nonce
-    uint8_t nonce_binding_secret[32];   // Secreto binding original del nonce  
-    uint8_t nonce_hiding_commitment[64]; // Commitment hiding para verificación
-    uint8_t nonce_binding_commitment[64]; // Commitment binding para verificación
-    uint8_t nonce_used;                 // 0=unused, 1=used (replay protection)
-    uint8_t nonce_valid;                // 0=invalid, 1=valid
-    uint8_t reserved[2];                // Para alineación futura
+    uint32_t nonce_session_id;
+    uint8_t nonce_hiding_secret[32];
+    uint8_t nonce_binding_secret[32];
+    uint8_t nonce_hiding_commitment[64];
+    uint8_t nonce_binding_commitment[64];
+    uint8_t nonce_used;
+    uint8_t nonce_valid;
+    uint8_t reserved[2];
 } __packed extended_frost_storage_t;
 
-// Global state
 static bool configured = false;
 static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
@@ -99,24 +92,19 @@ static uint8_t chunk_buffer[MY_HID_REPORT_SIZE];
 static secp256k1_context *secp256k1_ctx;
 static secp256k1_frost_keypair keypair;
 
-// Store computed signature share
 static secp256k1_frost_signature_share computed_signature_share;
 static bool signature_share_computed = false;
 
-// Current session ID for replay protection
 static uint32_t current_session_id = 0;
 
-// Receive buffer for accumulating messages
 #define REASSEMBLY_BUFFER_SIZE 2048
 static uint8_t receive_buffer[REASSEMBLY_BUFFER_SIZE];
 static size_t receive_buffer_pos = 0;
 static size_t expected_total_size = 0;
 static bool reassembling_message = false;
 
-// Mutex to protect buffer access
 K_MUTEX_DEFINE(buffer_mutex);
 
-// Report structure
 static struct report {
 	uint8_t id;
 	uint8_t value;
@@ -125,22 +113,18 @@ static struct report {
 	.value = 0,
 };
 
-// Timer for periodic reports
 static void report_event_handler(struct k_timer *dummy);
 K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
 #define REPORT_PERIOD K_SECONDS(2)
 
-// Timeout handling
 static void receive_timeout_handler(struct k_timer *timer);
 K_TIMER_DEFINE(receive_timeout_timer, receive_timeout_handler, NULL);
 
-// HID Report Descriptor
 static const uint8_t hid_report_desc[] = {
 	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
 	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
 	HID_COLLECTION(HID_COLLECTION_APPLICATION),
 	
-	// Input report (device to host)
 	HID_REPORT_ID(REPORT_ID_INPUT),
 	HID_LOGICAL_MIN8(0x00),
 	HID_LOGICAL_MAX16(0xFF, 0x00),
@@ -149,7 +133,6 @@ static const uint8_t hid_report_desc[] = {
 	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
 	HID_INPUT(0x02),
 	
-	// Output report (host to device)
 	HID_REPORT_ID(REPORT_ID_OUTPUT),
 	HID_LOGICAL_MIN8(0x00),
 	HID_LOGICAL_MAX16(0xFF, 0x00),
@@ -161,7 +144,6 @@ static const uint8_t hid_report_desc[] = {
 	HID_END_COLLECTION,
 };
 
-// ================== DEBUGGING FUNCTIONS ==================
 static void log_hex(const char *label, const uint8_t *data, size_t len) {
     char hexstr[129];
     size_t print_len = (len > 64) ? 64 : len;
@@ -187,8 +169,6 @@ static void reset_reassembly_state(void)
     LOG_INF("Reassembly state reset");
 }
 
-// ================== FLASH PERSISTENCE FUNCTIONS ==================
-
 static int read_extended_flash_data(void) {
     const struct flash_area *fa;
     int rc = flash_area_open(FIXED_PARTITION_ID(STORAGE_PARTITION), &fa);
@@ -211,7 +191,6 @@ static int read_extended_flash_data(void) {
         return rc;
     }
 
-    // Validar datos básicos de keypair
     if (flash_data.keypair_index == 0 || flash_data.keypair_index > 255) {
         LOG_WRN("Invalid keypair data (index=%u)", flash_data.keypair_index);
         return -EINVAL;
@@ -220,7 +199,6 @@ static int read_extended_flash_data(void) {
     flash_data_valid = true;
     LOG_INF("✅ Extended flash data loaded - Participant: %u", flash_data.keypair_index);
     
-    // Log nonce state
     if (flash_data.nonce_valid) {
         LOG_INF("💾 Stored nonce found - Session ID: %u, Used: %s", 
                 flash_data.nonce_session_id, 
@@ -245,7 +223,6 @@ static int write_extended_flash_data(void) {
         return rc;
     }
 
-    // Erase the flash area
     rc = flash_area_erase(fa, 0, sizeof(extended_frost_storage_t));
     if (rc != 0) {
         LOG_ERR("Failed to erase flash: %d", rc);
@@ -253,7 +230,6 @@ static int write_extended_flash_data(void) {
         return rc;
     }
 
-    // Write the data
     rc = flash_area_write(fa, 0, &flash_data, sizeof(extended_frost_storage_t));
     if (rc != 0) {
         LOG_ERR("Failed to write flash: %d", rc);
@@ -266,7 +242,6 @@ static int write_extended_flash_data(void) {
     return 0;
 }
 
-// ✅ GUARDAR NONCE EN FLASH después de generarlo
 static int save_nonce_to_flash(const secp256k1_frost_nonce *nonce, uint32_t session_id) {
     if (!nonce || !flash_data_valid) {
         LOG_ERR("❌ Cannot save nonce - invalid parameters");
@@ -275,16 +250,14 @@ static int save_nonce_to_flash(const secp256k1_frost_nonce *nonce, uint32_t sess
 
     LOG_INF("💾 === SAVING NONCE TO FLASH ===");
     
-    // Actualizar datos de nonce en la estructura flash
     flash_data.nonce_session_id = session_id;
     memcpy(flash_data.nonce_hiding_secret, nonce->hiding, 32);
     memcpy(flash_data.nonce_binding_secret, nonce->binding, 32);
     memcpy(flash_data.nonce_hiding_commitment, nonce->commitments.hiding, 64);
     memcpy(flash_data.nonce_binding_commitment, nonce->commitments.binding, 64);
-    flash_data.nonce_used = 0;      // Marcar como no usado
-    flash_data.nonce_valid = 1;     // Marcar como válido
+    flash_data.nonce_used = 0;
+    flash_data.nonce_valid = 1;
     
-    // Escribir a flash
     int rc = write_extended_flash_data();
     if (rc != 0) {
         LOG_ERR("❌ Failed to save nonce to flash: %d", rc);
@@ -301,7 +274,6 @@ static int save_nonce_to_flash(const secp256k1_frost_nonce *nonce, uint32_t sess
     return 0;
 }
 
-// ✅ CARGAR NONCE ORIGINAL desde flash
 static secp256k1_frost_nonce* load_original_nonce_from_flash(uint32_t expected_session_id) {
     if (!flash_data_valid) {
         LOG_ERR("❌ Cannot load nonce - flash data invalid");
@@ -316,7 +288,6 @@ static secp256k1_frost_nonce* load_original_nonce_from_flash(uint32_t expected_s
     if (flash_data.nonce_session_id != expected_session_id) {
         LOG_WRN("⚠️ Session ID mismatch - stored: %u, expected: %u", 
                 flash_data.nonce_session_id, expected_session_id);
-        // Continuar de todos modos - puede ser válido
     }
     
     if (flash_data.nonce_used) {
@@ -326,7 +297,6 @@ static secp256k1_frost_nonce* load_original_nonce_from_flash(uint32_t expected_s
     
     LOG_INF("💾 === LOADING ORIGINAL NONCE FROM FLASH ===");
     
-    // Reconstruir el nonce original
     secp256k1_frost_nonce* restored_nonce = 
         (secp256k1_frost_nonce*)malloc(sizeof(secp256k1_frost_nonce));
     
@@ -335,13 +305,12 @@ static secp256k1_frost_nonce* load_original_nonce_from_flash(uint32_t expected_s
         return NULL;
     }
     
-    // Restaurar TODOS los datos originales
     memcpy(restored_nonce->hiding, flash_data.nonce_hiding_secret, 32);
     memcpy(restored_nonce->binding, flash_data.nonce_binding_secret, 32);
     restored_nonce->commitments.index = keypair.public_keys.index;
     memcpy(restored_nonce->commitments.hiding, flash_data.nonce_hiding_commitment, 64);
     memcpy(restored_nonce->commitments.binding, flash_data.nonce_binding_commitment, 64);
-    restored_nonce->used = 0;  // Marcar como no usado para esta sesión de firma
+    restored_nonce->used = 0;
     
     LOG_INF("✅ Original nonce restored from flash");
     LOG_INF("💾 Session ID: %u", flash_data.nonce_session_id);
@@ -353,7 +322,6 @@ static secp256k1_frost_nonce* load_original_nonce_from_flash(uint32_t expected_s
     return restored_nonce;
 }
 
-// ✅ MARCAR NONCE COMO USADO (replay protection)
 static int mark_nonce_as_used(void) {
     if (!flash_data_valid || !flash_data.nonce_valid) {
         LOG_ERR("❌ Cannot mark nonce as used - invalid flash data");
@@ -362,7 +330,7 @@ static int mark_nonce_as_used(void) {
     
     LOG_INF("🔒 === MARKING NONCE AS USED ===");
     
-    flash_data.nonce_used = 1;  // Marcar como usado
+    flash_data.nonce_used = 1;
     
     int rc = write_extended_flash_data();
     if (rc != 0) {
@@ -374,7 +342,6 @@ static int mark_nonce_as_used(void) {
     return 0;
 }
 
-// ✅ VERIFICAR CONSISTENCY de commitment
 static bool verify_commitment_consistency(const serialized_nonce_commitment_t* coordinator_commitment) {
     if (!flash_data_valid || !flash_data.nonce_valid) {
         LOG_ERR("❌ Cannot verify commitment - no stored nonce");
@@ -383,7 +350,6 @@ static bool verify_commitment_consistency(const serialized_nonce_commitment_t* c
     
     LOG_INF("🔍 === VERIFYING COMMITMENT CONSISTENCY ===");
     
-    // Verificar que el commitment del coordinador coincide con lo que tenemos guardado
     bool hiding_match = (memcmp(coordinator_commitment->hiding, 
                                 flash_data.nonce_hiding_commitment, 64) == 0);
     bool binding_match = (memcmp(coordinator_commitment->binding, 
@@ -443,7 +409,6 @@ static void verify_keypair_consistency(void) {
         return;
     }
     
-    // Check that secret key is not all zeros
     bool secret_zeros = true;
     for (int i = 0; i < 32; i++) {
         if (keypair.secret[i] != 0) {
@@ -457,7 +422,6 @@ static void verify_keypair_consistency(void) {
         return;
     }
     
-    // Check that public keys are not all zeros
     bool pub_zeros = true, group_zeros = true;
     for (int i = 0; i < 64; i++) {
         if (keypair.public_keys.public_key[i] != 0) pub_zeros = false;
@@ -477,7 +441,6 @@ static void verify_keypair_consistency(void) {
     log_hex("  Group key (first 8 bytes)", keypair.public_keys.group_public_key, 8);
 }
 
-// ================== HID COMMUNICATION FUNCTIONS ==================
 static int send_chunked_data(const uint8_t *data, size_t len) {
     if (!configured || !data || len == 0) {
         return -EINVAL;
@@ -487,7 +450,6 @@ static int send_chunked_data(const uint8_t *data, size_t len) {
     int chunk_count = 0;
     
     while (offset < len) {
-        // Wait for endpoint to be available
         int timeout = 100;
         while (atomic_test_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG) && timeout-- > 0) {
             k_msleep(10);
@@ -497,7 +459,6 @@ static int send_chunked_data(const uint8_t *data, size_t len) {
             return -ETIMEDOUT;
         }
         
-        // Prepare chunk
         memset(chunk_buffer, 0, sizeof(chunk_buffer));
         chunk_buffer[0] = REPORT_ID_INPUT;
         size_t remaining = len - offset;
@@ -505,7 +466,6 @@ static int send_chunked_data(const uint8_t *data, size_t len) {
         chunk_buffer[1] = (uint8_t)chunk_size;
         memcpy(&chunk_buffer[2], data + offset, chunk_size);
         
-        // Send chunk
         atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
         int wrote;
         int ret = hid_int_ep_write(hdev, chunk_buffer, sizeof(chunk_buffer), &wrote);
@@ -554,7 +514,6 @@ static int send_message(uint8_t msg_type, uint32_t participant,
     return ret;
 }
 
-// ✅ PHASE 1: Generar Y PERSISTIR nonce, luego enviar commitment + keypair
 static int generate_and_save_nonce_PHASE1(void) {
     LOG_INF("🔑 === PHASE 1: GENERATE AND PERSIST NONCE ===");
     
@@ -563,13 +522,11 @@ static int generate_and_save_nonce_PHASE1(void) {
         return -1;
     }
     
-    // Generar session ID único para esta ronda
     current_session_id = sys_rand32_get();
     
     unsigned char binding_seed[32] = {0};
     unsigned char hiding_seed[32] = {0};
     
-    // Generar randomness FUERTE
     if (!fill_random(binding_seed, sizeof(binding_seed))) {
         LOG_ERR("❌ Failed to generate binding_seed");
         return -1;
@@ -584,7 +541,6 @@ static int generate_and_save_nonce_PHASE1(void) {
     log_hex("🔑 Binding seed", binding_seed, 8);
     log_hex("🔑 Hiding seed", hiding_seed, 8);
     
-    // Crear nonce EXACTAMENTE como example.c
     secp256k1_frost_nonce* fresh_nonce = secp256k1_frost_nonce_create(
         secp256k1_ctx, &keypair, binding_seed, hiding_seed);
     
@@ -597,7 +553,6 @@ static int generate_and_save_nonce_PHASE1(void) {
     log_hex("🔐 Generated hiding commitment", fresh_nonce->commitments.hiding, 16);
     log_hex("🔐 Generated binding commitment", fresh_nonce->commitments.binding, 16);
     
-    // ✅ GUARDAR INMEDIATAMENTE EN FLASH
     int save_result = save_nonce_to_flash(fresh_nonce, current_session_id);
     if (save_result != 0) {
         LOG_ERR("❌ Failed to save nonce to flash!");
@@ -605,7 +560,6 @@ static int generate_and_save_nonce_PHASE1(void) {
         return -1;
     }
     
-    // Ahora el nonce está seguro en flash - puede destruirse el temporal
     secp256k1_frost_nonce_destroy(fresh_nonce);
     
     LOG_INF("🎉 PHASE 1 NONCE GENERATION AND PERSISTENCE COMPLETE");
@@ -614,7 +568,6 @@ static int generate_and_save_nonce_PHASE1(void) {
     return 0;
 }
 
-// ✅ PHASE 1: Enviar commitment y keypair
 static int send_nonce_commitment_and_keypair_PHASE1(void) {
     LOG_INF("📤 === PHASE 1: SENDING NONCE COMMITMENT AND KEYPAIR ===");
     
@@ -623,7 +576,6 @@ static int send_nonce_commitment_and_keypair_PHASE1(void) {
         return -1;
     }
     
-    // Preparar payload combinado
     size_t payload_len = sizeof(serialized_nonce_commitment_t) + sizeof(serialized_keypair_t);
     uint8_t* combined_payload = malloc(payload_len);
     if (!combined_payload) {
@@ -631,13 +583,11 @@ static int send_nonce_commitment_and_keypair_PHASE1(void) {
         return -ENOMEM;
     }
 
-    // Primera parte: nonce commitment (desde flash)
     serialized_nonce_commitment_t* nonce_part = (serialized_nonce_commitment_t*)combined_payload;
     nonce_part->index = keypair.public_keys.index;
     memcpy(nonce_part->hiding, flash_data.nonce_hiding_commitment, 64);
     memcpy(nonce_part->binding, flash_data.nonce_binding_commitment, 64);
 
-    // Segunda parte: keypair (para agregación)
     serialized_keypair_t* keypair_part = (serialized_keypair_t*)(combined_payload + sizeof(serialized_nonce_commitment_t));
     keypair_part->index = keypair.public_keys.index;
     keypair_part->max_participants = keypair.public_keys.max_participants;
@@ -666,7 +616,6 @@ static int send_nonce_commitment_and_keypair_PHASE1(void) {
     return ret;
 }
 
-// ✅ PHASE 3: Enviar signature share y marcar nonce como usado
 static int send_signature_share_and_mark_used_PHASE3(void) {
     LOG_INF("📤 === PHASE 3: SENDING SIGNATURE SHARE AND MARKING NONCE USED ===");
     
@@ -691,7 +640,6 @@ static int send_signature_share_and_mark_used_PHASE3(void) {
     if (ret == 0) {
         LOG_INF("✅ PHASE 3 SUCCESS: Signature share sent to coordinator");
         
-        // ✅ MARCAR NONCE COMO USADO para replay protection
         int mark_result = mark_nonce_as_used();
         if (mark_result == 0) {
             LOG_INF("🔒 Nonce marked as used - replay protection activated");
@@ -707,7 +655,6 @@ static int send_signature_share_and_mark_used_PHASE3(void) {
     return ret;
 }
 
-// ✅ PHASE 2: Procesar signing usando nonce ORIGINAL desde flash
 static void process_sign_message_PHASE2_FIXED(void) {
     LOG_INF("📝 === PHASE 2: PROCESSING SIGN MESSAGE (FIXED - ORIGINAL NONCE) ===");
     
@@ -719,7 +666,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
         return;
     }
     
-    // Parsear payload
     uint8_t* msg_hash = (uint8_t*)payload;
     uint32_t num_commitments = *(uint32_t*)(payload + 32);
     serialized_nonce_commitment_t* serialized_commitments = (serialized_nonce_commitment_t*)(payload + 32 + 4);
@@ -730,7 +676,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
             msg_hash[4], msg_hash[5], msg_hash[6], msg_hash[7]);
     LOG_INF("📋 Number of commitments: %u", num_commitments);
     
-    // Verificar message hash
     unsigned char expected_msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
     unsigned char expected_hash[32];
     unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '_', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
@@ -742,7 +687,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
     }
     LOG_INF("✅ Message hash verified correctly (Hello World!)");
     
-    // ✅ ENCONTRAR NUESTRO COMMITMENT en la lista del coordinador
     serialized_nonce_commitment_t* our_commitment_from_coordinator = NULL;
     
     for (uint32_t i = 0; i < num_commitments; i++) {
@@ -758,13 +702,11 @@ static void process_sign_message_PHASE2_FIXED(void) {
         return;
     }
     
-    // ✅ VERIFICAR CONSISTENCY con datos guardados en flash
     if (!verify_commitment_consistency(our_commitment_from_coordinator)) {
         LOG_ERR("❌ Commitment consistency verification failed!");
         return;
     }
     
-    // ✅ CARGAR NONCE ORIGINAL desde flash
     secp256k1_frost_nonce* original_nonce = 
         load_original_nonce_from_flash(current_session_id);
     
@@ -775,7 +717,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
     
     LOG_INF("🎉 Using ORIGINAL nonce from flash persistence");
     
-    // Convertir commitments a formato secp256k1 en ORDEN EXACTO
     secp256k1_frost_nonce_commitment *signing_commitments = 
         malloc(num_commitments * sizeof(secp256k1_frost_nonce_commitment));
     if (!signing_commitments) {
@@ -784,7 +725,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
         return;
     }
     
-    // Preservar el ORDEN EXACTO recibido del coordinador
     for (uint32_t i = 0; i < num_commitments; i++) {
         signing_commitments[i].index = serialized_commitments[i].index;
         memcpy(signing_commitments[i].hiding, serialized_commitments[i].hiding, 64);
@@ -793,7 +733,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
         LOG_INF("📋 Commitment %u: participant %u", i, signing_commitments[i].index);
     }
     
-    // ✅ COMPUTAR signature share usando nonce ORIGINAL
     LOG_INF("🔄 Computing signature share using ORIGINAL nonce from flash...");
     LOG_INF("📋 Participant index: %u", keypair.public_keys.index);
     LOG_INF("📋 Number of signers: %u", num_commitments);
@@ -801,7 +740,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
     
     memset(&computed_signature_share, 0, sizeof(computed_signature_share));
     
-    // ✅ Esta es la llamada crítica - usar nonce ORIGINAL
     int return_val = secp256k1_frost_sign(&computed_signature_share,
                                          msg_hash, num_commitments,
                                          &keypair, original_nonce, signing_commitments);
@@ -813,7 +751,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
         LOG_INF("🎉 Used ORIGINAL nonce from flash persistence");
         log_hex("🎯 SIGNATURE SHARE (32 bytes)", computed_signature_share.response, 32);
         
-        // Verificar que la respuesta no es todo ceros
         bool all_zeros = true;
         for (int i = 0; i < 32; i++) {
             if (computed_signature_share.response[i] != 0) {
@@ -828,7 +765,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
         } else {
             LOG_INF("✅ Signature share appears valid (not all zeros)");
             
-            // Imprimir signature share exactamente como example.c
             char hex_str[65];
             for (int i = 0; i < 32; i++) {
                 sprintf(hex_str + i * 2, "%02x", computed_signature_share.response[i]);
@@ -839,7 +775,6 @@ static void process_sign_message_PHASE2_FIXED(void) {
             printk("Signature: %s\n", hex_str);
             printk("=============================\n\n");
             
-            // Programar envío de signature share
             k_work_submit(&send_share_work);
         }
         
@@ -848,12 +783,10 @@ static void process_sign_message_PHASE2_FIXED(void) {
         signature_share_computed = false;
     }
     
-    // Limpiar
     free(signing_commitments);
     free(original_nonce);
 }
 
-// ================== MESSAGE PROCESSING FUNCTIONS ==================
 static void process_received_message(void) {
     if (receive_buffer_pos < sizeof(message_header_t)) {
         return;
@@ -861,7 +794,6 @@ static void process_received_message(void) {
     
     const message_header_t *header = (const message_header_t *)receive_buffer;
     
-    // Validate message header
     if (header->magic != MSG_HEADER_MAGIC || header->version != MSG_VERSION) {
         LOG_WRN("Invalid message header: magic=0x%08x, version=%d", 
                 header->magic, header->version);
@@ -869,13 +801,11 @@ static void process_received_message(void) {
         return;
     }
     
-    // Check if we have the complete message
     size_t expected_total = sizeof(message_header_t) + header->payload_len;
     if (receive_buffer_pos < expected_total) {
         return;
     }
     
-    // Process the message
     switch (header->msg_type) {
         case MSG_TYPE_READY:
             LOG_INF("📨 *** Received READY signal from host (participant %u) ***", header->participant);
@@ -892,7 +822,6 @@ static void process_received_message(void) {
             break;
     }
     
-    // Reset buffer after processing
     receive_buffer_pos = 0;
 }
 
@@ -908,12 +837,10 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
         return;
     }
     
-    // Extract chunk info: [Report ID][Length][Data...]
     uint8_t report_id = data[0];
     uint8_t chunk_len = data[1];
     const uint8_t *chunk_data = data + 2;
     
-    // Validate chunk
     if (report_id != REPORT_ID_OUTPUT) {
         LOG_WRN("Wrong report ID: 0x%02x", report_id);
         k_mutex_unlock(&buffer_mutex);
@@ -926,7 +853,6 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
         return;
     }
     
-    // Check if this is the start of a new message
     if (!reassembling_message && chunk_len >= sizeof(message_header_t)) {
         const message_header_t *header = (const message_header_t *)chunk_data;
         if (header->magic == MSG_HEADER_MAGIC) {
@@ -951,7 +877,6 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
         }
     }
     
-    // Add chunk to reassembly buffer
     if (reassembling_message) {
         size_t space_available = REASSEMBLY_BUFFER_SIZE - receive_buffer_pos;
         size_t bytes_to_copy = (chunk_len > space_available) ? space_available : chunk_len;
@@ -960,7 +885,6 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
             memcpy(receive_buffer + receive_buffer_pos, chunk_data, bytes_to_copy);
             receive_buffer_pos += bytes_to_copy;
             
-            // Check if message is complete
             if (receive_buffer_pos >= expected_total_size) {
                 LOG_INF("📨 MESSAGE COMPLETE: Processing %zu bytes", expected_total_size);
                 
@@ -989,7 +913,6 @@ static void receive_timeout_handler(struct k_timer *timer)
     }
 }
 
-// ================== WORK HANDLERS ==================
 static void send_share_work_handler(struct k_work *work) {
     LOG_INF("🏃‍♂️ send_share_work_handler called");
     
@@ -1020,9 +943,7 @@ static void sign_work_handler(struct k_work *work) {
         case MSG_TYPE_READY:
             LOG_INF("🏃‍♂️ Processing READY message - PHASE 1");
             
-            // ✅ Generar Y PERSISTIR nonce
             if (generate_and_save_nonce_PHASE1() == 0) {
-                // ✅ Enviar commitment desde datos persistidos
                 if (send_nonce_commitment_and_keypair_PHASE1() == 0) {
                     send_message(MSG_TYPE_END_TRANSMISSION, keypair.public_keys.index, NULL, 0);
                 }
@@ -1031,7 +952,6 @@ static void sign_work_handler(struct k_work *work) {
             
         case MSG_TYPE_SIGN:
             LOG_INF("🏃‍♂️ Processing SIGN message - PHASE 2 (FIXED with original nonce)");
-            // ✅ Usar función que maneja nonce ORIGINAL desde flash
             process_sign_message_PHASE2_FIXED();
             break;
             
@@ -1066,7 +986,6 @@ static void report_event_handler(struct k_timer *dummy)
 	}
 }
 
-// ================== HID CALLBACKS ==================
 static void int_in_ready_cb(const struct device *dev) {
     atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 }
@@ -1117,7 +1036,6 @@ static const struct hid_ops ops = {
     .set_report = set_report_cb,
 };
 
-// USB status callback
 static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
     switch (status) {
     case USB_DC_RESET:
@@ -1141,13 +1059,11 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param) {
     }
 }
 
-// ================== MAIN FUNCTION ==================
 int main(void) {
     int ret;
     LOG_INF("🚀 === FROST HID Device with NONCE PERSISTENCE ===");
     LOG_INF("💾 Nonces survive device restarts via flash storage");
     
-    // Crear contexto secp256k1 EXACTAMENTE como example.c
     secp256k1_ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (secp256k1_ctx == NULL) {
@@ -1156,28 +1072,23 @@ int main(void) {
     }
     LOG_INF("✅ secp256k1 context created successfully");
     
-    // Inicializar work queues
     k_work_init(&sign_work, sign_work_handler);
     k_work_init(&send_share_work, send_share_work_handler);
     k_work_init(&report_send, send_report);
     LOG_INF("✅ Work queues initialized");
     
-    // ✅ Leer datos extendidos de flash
     if (read_extended_flash_data() != 0) {
         LOG_ERR("❌ Failed to read extended flash data");
         return -1;
     }
     
-    // Cargar material de llaves
     if (load_frost_key_material() != 0) {
         LOG_ERR("❌ Failed to load key material");
         return -1;
     }
     
-    // Verificar consistencia del keypair
     verify_keypair_consistency();
     
-    // Inicializar USB HID
     hdev = device_get_binding("HID_0");
     if (hdev == NULL) {
         LOG_ERR("❌ Cannot get USB HID Device");
@@ -1186,7 +1097,6 @@ int main(void) {
     
     usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc), &ops);
     
-    // Iniciar timer periódico
     atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
     k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
     
@@ -1207,12 +1117,10 @@ int main(void) {
     LOG_INF("💾 Flash storage supports nonce persistence across restarts");
     LOG_INF("🔒 Replay protection activated");
     
-    // Loop principal
     while (1) {
         k_msleep(1000);
     }
     
-    // Cleanup (nunca se alcanza)
     secp256k1_context_destroy(secp256k1_ctx);
     
     return 0;
