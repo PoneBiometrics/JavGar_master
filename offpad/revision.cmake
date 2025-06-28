@@ -1,8 +1,0 @@
-set(OFFPAD_REVISIONS "MP1_V2" "MP1_V3" "MP1_V4" "MP1_V5" "MP2_V1")
-if (NOT DEFINED BOARD_REVISION)
-  set(BOARD_REVISION "MP2_V1")
-else()
-  if (NOT BOARD_REVISION IN_LIST OFFPAD_REVISIONS)
-    message(FATAL_ERROR "${BOARD_REVISION} is not a valid revision for Offpad. Accepted revisions: ${OFFPAD_REVISIONS}")
-  endif()
-endif()
