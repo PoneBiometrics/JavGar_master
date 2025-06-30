@@ -1,4 +1,3 @@
-/* FROST Key Receiver - CORRECTED VERSION - No Infinite Loops */
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
 #include <zephyr/usb/usb_device.h>
@@ -85,8 +84,8 @@ static struct received_frost_data {
     bool has_commitments;
     bool transmission_complete;
     bool flash_write_pending;
-    bool operation_complete;         // NEW: Track when everything is done
-    bool system_shutting_down;       // NEW: Track shutdown state
+    bool operation_complete;         
+    bool system_shutting_down;       
     
     struct serialized_share secret_share;
     struct serialized_pubkey public_key;
@@ -134,9 +133,7 @@ K_TIMER_DEFINE(receive_timeout_timer, receive_timeout_handler, NULL);
 static void shutdown_timer_handler(struct k_timer *timer);
 K_TIMER_DEFINE(shutdown_timer, shutdown_timer_handler, NULL);
 
-/*
- * HID Report Descriptor
- */
+// HID Report Descriptor
 static const uint8_t hid_report_desc[] = {
     HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
     HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
@@ -163,7 +160,7 @@ static const uint8_t hid_report_desc[] = {
     HID_END_COLLECTION,
 };
 
-// Helper function to safely print hex data
+// Helper function to print hex data
 static void print_hex_safe(const char *label, const uint8_t *data, size_t len)
 {
     if (!data || len == 0) {
@@ -409,14 +406,12 @@ static int read_frost_data_from_flash(void) {
     return 0;
 }
 
-// CORRECTED: Safe shutdown function without infinite loops
 static void perform_safe_shutdown(void)
 {
     LOG_INF("=== MISSION ACCOMPLISHED ===");
     LOG_INF("FROST key for participant %u stored successfully", received_data.participant_id);
     LOG_INF("Device can be safely disconnected from USB.");
     
-    // Mark system as shutting down
     received_data.system_shutting_down = true;
     received_data.operation_complete = true;
     
@@ -430,8 +425,6 @@ static void perform_safe_shutdown(void)
     
     LOG_INF("SUCCESS: Operation complete - system ready for disconnect");
     
-    // Exit cleanly - NO INFINITE LOOPS
-    // The main thread will handle the rest
 }
 
 // Cleanup work handler
@@ -440,7 +433,7 @@ static void cleanup_work_handler(struct k_work *work)
     perform_safe_shutdown();
 }
 
-// CORRECTED: Flash work handler without infinite loop
+// Flash work handler
 static void flash_work_handler(struct k_work *work)
 {
     LOG_INF("Starting flash write operation...");
@@ -468,7 +461,7 @@ static void flash_work_handler(struct k_work *work)
             // Mark flash operation as complete
             received_data.flash_write_pending = false;
             
-            // CORRECTED: Schedule cleanup instead of infinite loop
+            // Schedule cleanup
             k_work_submit(&cleanup_work);
             
         } else {
@@ -478,7 +471,7 @@ static void flash_work_handler(struct k_work *work)
         LOG_ERR("Failed to store data to flash (error: %d)", rc);
     }
     
-    // CORRECTED: Exit cleanly from work handler
+    // Exit cleanly from work handler
     LOG_INF("Flash work handler exiting cleanly");
 }
 
@@ -648,7 +641,7 @@ static void receive_timeout_handler(struct k_timer *timer)
     }
 }
 
-// Enhanced chunked data handler
+// Chunked data handler
 static void handle_chunked_data(const uint8_t *data, size_t len)
 {
     // Don't process data if system is shutting down
@@ -666,7 +659,7 @@ static void handle_chunked_data(const uint8_t *data, size_t len)
         return;
     }
     
-    // Extract chunk info: [Report ID][Length][Data...]
+    // Extract chunk info
     uint8_t report_id = data[0];
     uint8_t chunk_len = data[1];
     const uint8_t *chunk_data = data + 2;
@@ -943,7 +936,7 @@ int main(void)
     LOG_INF("=== FROST HID Receiver Ready ===");
     LOG_INF("Reassembly buffer size: %d bytes", REASSEMBLY_BUFFER_SIZE);
     
-    // CORRECTED: Safe main loop that waits for completion
+    // Safe main loop that waits for completion
     while (!received_data.operation_complete) {
         k_sleep(K_SECONDS(1));
         
