@@ -63,8 +63,8 @@ static void log_protocol_phase(const char *phase) {
 
 int main(void) {
 
-    LOG_INF("🚀 Starting FROST (Flexible Round-Optimized Schnorr Threshold) Protocol Example");
-    LOG_INF("📋 This example demonstrates distributed threshold signature generation");
+    LOG_INF("Starting FROST (Flexible Round-Optimized Schnorr Threshold) Protocol Example");
+    LOG_INF("This example demonstrates distributed threshold signature generation");
     
     log_system_requirements();
 
@@ -81,7 +81,7 @@ int main(void) {
     int is_signature_valid;
     int return_val;
 
-    LOG_INF("📝 Message to sign: \"%s\"", msg);
+    LOG_INF("Message to sign: \"%s\"", msg);
     LOG_INF("🏷️  Hash tag: \"%s\"", tag);
     log_hex("Raw Message Bytes", msg, sizeof(msg));
 
@@ -104,27 +104,27 @@ int main(void) {
     sign_verify_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     
     if (sign_verify_ctx == NULL) {
-        LOG_ERR("❌ Failed to create secp256k1 context!");
+        LOG_ERR("Failed to create secp256k1 context!");
         return 1;
     }
-    LOG_INF("✅ Context created successfully");
-    LOG_INF("📊 Context capabilities: SIGN | VERIFY");
+    LOG_INF("Context created successfully");
+    LOG_INF("Context capabilities: SIGN | VERIFY");
 
     /*** Key Generation Phase ***/
     log_protocol_phase("KEY GENERATION");
     
-    LOG_INF("🔑 Starting distributed key generation with trusted dealer...");
+    LOG_INF("Starting distributed key generation with trusted dealer...");
     LOG_INF("📈 Creating VSS (Verifiable Secret Sharing) commitments...");
     LOG_INF("   Threshold: %d participants needed to sign", EXAMPLE_MIN_PARTICIPANTS);
     
     dealer_commitments = secp256k1_frost_vss_commitments_create(EXAMPLE_MIN_PARTICIPANTS);
     if (dealer_commitments == NULL) {
-        LOG_ERR("❌ Failed to create VSS commitments!");
+        LOG_ERR("Failed to create VSS commitments!");
         return 1;
     }
-    LOG_INF("✅ VSS commitments created successfully");
+    LOG_INF("VSS commitments created successfully");
 
-    LOG_INF("🎲 Generating keys for %d participants (threshold = %d)...", 
+    LOG_INF("Generating keys for %d participants (threshold = %d)...", 
             EXAMPLE_MAX_PARTICIPANTS, EXAMPLE_MIN_PARTICIPANTS);
     
     return_val = secp256k1_frost_keygen_with_dealer(sign_verify_ctx, dealer_commitments,
@@ -132,26 +132,26 @@ int main(void) {
                                                 EXAMPLE_MAX_PARTICIPANTS, EXAMPLE_MIN_PARTICIPANTS);
 
     if (return_val != 1) {
-        LOG_ERR("❌ Key generation failed! Return value: %d", return_val);
+        LOG_ERR("Key generation failed! Return value: %d", return_val);
         return 1;
     }
-    LOG_INF("✅ Key generation completed successfully");
+    LOG_INF("Key generation completed successfully");
 
-    LOG_INF("📤 Extracting public keys from keypairs...");
+    LOG_INF("Extracting public keys from keypairs...");
     /* Extracting public_keys from keypair. This operation is intended to be executed by each signer.  */
     for (index = 0; index < EXAMPLE_MAX_PARTICIPANTS; index++) {
         LOG_INF("👤 Processing Participant #%d...", index);
         
         return_val = secp256k1_frost_pubkey_from_keypair(&public_keys[index], &keypairs[index]);
         if (return_val != 1) {
-            LOG_ERR("❌ Failed to extract public key for participant #%d", index);
+            LOG_ERR("Failed to extract public key for participant #%d", index);
             return 1;
         }
         
         // Log detailed keypair information
         log_frost_keypair("Participant", &keypairs[index]);
         
-        LOG_INF("✅ Participant #%d keys extracted successfully", index);
+        LOG_INF("Participant #%d keys extracted successfully", index);
     }
 
     LOG_INF("🌐 Shared Group Information:");
@@ -162,23 +162,23 @@ int main(void) {
     /*** Nonce Generation Phase ***/
     log_protocol_phase("NONCE GENERATION");
     
-    LOG_INF("🎯 Generating nonces for signing participants...");
+    LOG_INF("Generating nonces for signing participants...");
     LOG_INF("   Note: Only %d out of %d participants will sign", EXAMPLE_MIN_PARTICIPANTS, EXAMPLE_MAX_PARTICIPANTS);
 
     for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
-        LOG_INF("🎲 Generating nonce for Participant #%d...", index);
+        LOG_INF("Generating nonce for Participant #%d...", index);
 
         /* Generate 32 bytes of randomness to use for computing the nonce. */
         LOG_INF("   Generating binding seed...");
         if (!fill_random(binding_seed, sizeof(binding_seed))) {
-            LOG_ERR("❌ Failed to generate binding_seed for participant #%d", index);
+            LOG_ERR("Failed to generate binding_seed for participant #%d", index);
             return 1;
         }
         log_hex("   Binding Seed", binding_seed, sizeof(binding_seed));
 
         LOG_INF("   Generating hiding seed...");
         if (!fill_random(hiding_seed, sizeof(hiding_seed))) {
-            LOG_ERR("❌ Failed to generate hiding_seed for participant #%d", index);
+            LOG_ERR("Failed to generate hiding_seed for participant #%d", index);
             return 1;
         }
         log_hex("   Hiding Seed", hiding_seed, sizeof(hiding_seed));
@@ -189,7 +189,7 @@ int main(void) {
                                                      binding_seed, hiding_seed);
 
         if (nonces[index] == NULL) {
-            LOG_ERR("❌ Failed to create nonce for participant #%d", index);
+            LOG_ERR("Failed to create nonce for participant #%d", index);
             return 1;
         }
 
@@ -200,22 +200,22 @@ int main(void) {
         LOG_INF("   Sharing nonce commitments...");
         memcpy(&signing_commitments[index], &(nonces[index]->commitments), sizeof(secp256k1_frost_nonce_commitment));
         
-        LOG_INF("✅ Nonce generated successfully for Participant #%d", index);
+        LOG_INF("Nonce generated successfully for Participant #%d", index);
     }
 
     /*** Message Hashing Phase ***/
     log_protocol_phase("MESSAGE HASHING");
     
-    LOG_INF("🔒 Hashing message for signing...");
+    LOG_INF("Hashing message for signing...");
     LOG_INF("   Using tagged SHA256 with tag: \"%s\"", tag);
     
     return_val = secp256k1_tagged_sha256(sign_verify_ctx, msg_hash, tag, sizeof(tag), msg, sizeof(msg));
     if (return_val != 1) {
-        LOG_ERR("❌ Failed to hash message! Return value: %d", return_val);
+        LOG_ERR("Failed to hash message! Return value: %d", return_val);
         return 1;
     }
     
-    LOG_INF("✅ Message hashed successfully");
+    LOG_INF("Message hashed successfully");
     log_hex("Original Message", msg, sizeof(msg));
     log_hex("Message Hash (to be signed)", msg_hash, sizeof(msg_hash));
 
@@ -226,7 +226,7 @@ int main(void) {
     LOG_INF("   Each participant creates their signature share independently");
 
     for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
-        LOG_INF("📝 Participant #%d creating signature share...", index);
+        LOG_INF("Participant #%d creating signature share...", index);
         LOG_INF("   Input parameters:");
         LOG_INF("     - Message hash: [32 bytes]");
         LOG_INF("     - Number of signers: %d", EXAMPLE_MIN_PARTICIPANTS);
@@ -238,20 +238,20 @@ int main(void) {
                              &keypairs[index], nonces[index], signing_commitments);
 
         if (return_val != 1) {
-            LOG_ERR("❌ Failed to create signature share for participant #%d! Return value: %d", index, return_val);
+            LOG_ERR("Failed to create signature share for participant #%d! Return value: %d", index, return_val);
             return 1;
         }
 
         // Log signature share details
         log_frost_signature_share("Participant", &signature_shares[index]);
         
-        LOG_INF("✅ Signature share created successfully for Participant #%d", index);
+        LOG_INF("Signature share created successfully for Participant #%d", index);
     }
 
     /*** Signature Aggregation Phase ***/
     log_protocol_phase("SIGNATURE AGGREGATION");
     
-    LOG_INF("🔗 Aggregating signature shares into final FROST signature...");
+    LOG_INF("Aggregating signature shares into final FROST signature...");
     LOG_INF("   Aggregator: Participant #0 (could be any participant or external entity)");
     LOG_INF("   Input: %d signature shares", EXAMPLE_MIN_PARTICIPANTS);
     
@@ -260,17 +260,17 @@ int main(void) {
         signature_shares, EXAMPLE_MIN_PARTICIPANTS);
 
     if (return_val != 1) {
-        LOG_ERR("❌ Failed to aggregate signature shares! Return value: %d", return_val);
+        LOG_ERR("Failed to aggregate signature shares! Return value: %d", return_val);
         return 1;
     }
 
-    LOG_INF("✅ Signature aggregation completed successfully");
+    LOG_INF("Signature aggregation completed successfully");
     log_hex("Final FROST Signature", signature, sizeof(signature));
 
     /*** Signature Verification Phase ***/
     log_protocol_phase("SIGNATURE VERIFICATION");
     
-    LOG_INF("🔍 Verifying FROST signature...");
+    LOG_INF("Verifying FROST signature...");
     LOG_INF("   Verification inputs:");
     LOG_INF("     - Signature: [64 bytes]");
     LOG_INF("     - Message hash: [32 bytes]");
@@ -279,24 +279,24 @@ int main(void) {
     is_signature_valid = secp256k1_frost_verify(sign_verify_ctx, signature, msg_hash, &keypairs[0].public_keys);
 
     if (is_signature_valid) {
-        LOG_INF("✅ Signature verification: VALID");
-        LOG_INF("🎉 FROST protocol completed successfully!");
+        LOG_INF("Signature verification: VALID");
+        LOG_INF("FROST protocol completed successfully!");
     } else {
-        LOG_ERR("❌ Signature verification: INVALID");
+        LOG_ERR("Signature verification: INVALID");
         LOG_ERR("💥 FROST protocol failed!");
     }
 
     /*** Final Summary ***/
     log_protocol_phase("PROTOCOL SUMMARY");
     
-    LOG_INF("📊 FROST Protocol Execution Summary:");
+    LOG_INF("FROST Protocol Execution Summary:");
     LOG_INF("   Total Participants: %d", EXAMPLE_MAX_PARTICIPANTS);
     LOG_INF("   Signing Participants: %d", EXAMPLE_MIN_PARTICIPANTS);
     LOG_INF("   Threshold: %d-of-%d", EXAMPLE_MIN_PARTICIPANTS, EXAMPLE_MAX_PARTICIPANTS);
     LOG_INF("   Message: \"%s\"", msg);
     LOG_INF("   Signature Valid: %s", is_signature_valid ? "YES" : "NO");
     
-    LOG_INF("🔑 Key Information:");
+    LOG_INF("Key Information:");
     log_hex("  Group Public Key", keypairs[0].public_keys.group_public_key, sizeof(keypairs[0].public_keys.group_public_key));
     log_hex("  Final Signature", signature, sizeof(signature));
     log_hex("  Message Hash", msg_hash, sizeof(msg_hash));
@@ -311,13 +311,13 @@ int main(void) {
     LOG_INF("🧹 Cleaning up resources...");
     if (sign_verify_ctx) {
         secp256k1_context_destroy(sign_verify_ctx);
-        LOG_INF("✅ Context destroyed");
+        LOG_INF("Context destroyed");
     }
     
     for (index = 0; index < EXAMPLE_MIN_PARTICIPANTS; index++) {
         if (nonces[index]) {
             // Note: Specific cleanup depends on secp256k1_frost implementation
-            LOG_INF("✅ Cleaned up nonce for participant #%d", index);
+            LOG_INF("Cleaned up nonce for participant #%d", index);
         }
     }
 

@@ -8,14 +8,19 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
+#include <psapi.h>
+#include <math.h>
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
+#pragma comment(lib, "psapi.lib")
 
 #define N 3
 #define T 2
 
 #define VENDOR_ID 0x2FE3   
 #define PRODUCT_ID 0x100   
+
+// TYPE DEFINITIONS
 
 typedef enum {
     COMM_TYPE_UART = 1,
@@ -82,6 +87,259 @@ typedef struct {
     uint8_t group_public_key[64];
 } serialized_keypair_t;
 #pragma pack(pop)
+
+// EVALUATION STRUCTURES
+
+typedef struct {
+    double measurements[100];
+    int num_samples;
+    double mean;
+    double std_deviation;
+    double min_time;
+    double max_time;
+    double coefficient_variation;
+} performance_stats_t;
+
+typedef struct {
+    SIZE_T initial_memory;
+    SIZE_T peak_memory;
+    SIZE_T overhead;
+    double percentage_increase;
+} memory_stats_t;
+
+typedef struct {
+    size_t message_header_size;
+    size_t public_key_size;
+    size_t commitments_size;
+    size_t secret_share_size;
+    size_t signature_share_size;
+    size_t total_per_participant;
+    size_t protocol_overhead;
+} protocol_sizes_t;
+
+typedef struct {
+    double transmission_time;
+    size_t data_size;
+    double throughput_bps;
+    int segments_required;
+    double overhead_percentage;
+} communication_stats_t;
+
+// TIMING FUNCTIONS 
+
+static LARGE_INTEGER frequency;
+static BOOL frequency_initialized = FALSE;
+
+void init_performance_counter() {
+    if (!frequency_initialized) {
+        QueryPerformanceFrequency(&frequency);
+        frequency_initialized = TRUE;
+        printf("Performance counter initialized (frequency: %lld Hz)\n", frequency.QuadPart);
+    }
+}
+
+double get_time_milliseconds() {
+    init_performance_counter();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)(counter.QuadPart * 1000.0) / frequency.QuadPart;
+}
+
+void calculate_performance_stats(performance_stats_t* stats) {
+    if (stats->num_samples <= 0) return;
+    
+    // Mean calculation
+    double sum = 0.0;
+    stats->min_time = stats->measurements[0];
+    stats->max_time = stats->measurements[0];
+    
+    for (int i = 0; i < stats->num_samples; i++) {
+        sum += stats->measurements[i];
+        if (stats->measurements[i] < stats->min_time) stats->min_time = stats->measurements[i];
+        if (stats->measurements[i] > stats->max_time) stats->max_time = stats->measurements[i];
+    }
+    stats->mean = sum / stats->num_samples;
+    
+    // Standard deviation
+    double variance_sum = 0.0;
+    for (int i = 0; i < stats->num_samples; i++) {
+        double diff = stats->measurements[i] - stats->mean;
+        variance_sum += diff * diff;
+    }
+    stats->std_deviation = sqrt(variance_sum / stats->num_samples);
+    
+    // Coefficient of variation
+    stats->coefficient_variation = (stats->std_deviation / stats->mean) * 100.0;
+}
+
+void print_performance_stats(const char* operation, performance_stats_t* stats) {
+    printf("\n=== PERFORMANCE ANALYSIS: %s ===\n", operation);
+    printf("   Samples collected: %d\n", stats->num_samples);
+    printf("   Mean execution time: %.3f ms\n", stats->mean);
+    printf("   Standard deviation: %.3f ms\n", stats->std_deviation);
+    printf("   Execution time range: %.3f ms to %.3f ms\n", stats->min_time, stats->max_time);
+    printf("   Coefficient of variation: %.1f%%\n", stats->coefficient_variation);
+    
+    if (stats->coefficient_variation < 20.0) {
+        printf("   Performance: VERY STABLE\n");
+    } else if (stats->coefficient_variation < 40.0) {
+        printf("   Performance: MODERATELY STABLE\n");
+    } else {
+        printf("   Performance: HIGH VARIABILITY\n");
+    }
+    printf("========================================\n");
+}
+
+// MEMORY MONITORING 
+
+SIZE_T get_current_memory_usage() {
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        return pmc.WorkingSetSize / 1024; // Convert to KB
+    }
+    return 0;
+}
+
+void init_memory_monitoring(memory_stats_t* mem_stats) {
+    mem_stats->initial_memory = get_current_memory_usage();
+    mem_stats->peak_memory = mem_stats->initial_memory;
+    printf("Memory monitoring initialized (initial: %zu KB)\n", mem_stats->initial_memory);
+}
+
+void update_memory_monitoring(memory_stats_t* mem_stats) {
+    SIZE_T current_memory = get_current_memory_usage();
+    if (current_memory > mem_stats->peak_memory) {
+        mem_stats->peak_memory = current_memory;
+    }
+}
+
+void finalize_memory_monitoring(memory_stats_t* mem_stats) {
+    mem_stats->overhead = mem_stats->peak_memory - mem_stats->initial_memory;
+    mem_stats->percentage_increase = ((double)mem_stats->overhead / mem_stats->initial_memory) * 100.0;
+}
+
+void print_memory_stats(const char* operation, memory_stats_t* mem_stats) {
+    printf("\n=== MEMORY ANALYSIS: %s ===\n", operation);
+    printf("   Initial memory usage: %zu KB\n", mem_stats->initial_memory);
+    printf("   Peak memory usage: %zu KB\n", mem_stats->peak_memory);
+    printf("   Memory overhead: %zu KB\n", mem_stats->overhead);
+    printf("   Percentage increase: %.1f%%\n", mem_stats->percentage_increase);
+    
+    if (mem_stats->percentage_increase < 5.0) {
+        printf("   Memory efficiency: EXCELLENT\n");
+    } else if (mem_stats->percentage_increase < 15.0) {
+        printf("    Memory efficiency: GOOD\n");
+    } else {
+        printf("   Memory efficiency: HIGH OVERHEAD\n");
+    }
+    printf("======================================\n");
+}
+
+// PROTOCOL SIZE MEASUREMENT
+
+void measure_protocol_sizes(protocol_sizes_t* sizes) {
+    sizes->message_header_size = sizeof(message_header_t);
+    sizes->public_key_size = sizeof(serialized_keypair_t);
+    sizes->commitments_size = sizeof(serialized_nonce_commitment_t);
+    sizes->secret_share_size = 36; 
+    sizes->signature_share_size = sizeof(serialized_signature_share_t);
+    
+    // Calculate totals
+    sizes->total_per_participant = sizes->message_header_size + sizes->public_key_size + sizes->commitments_size;
+    sizes->protocol_overhead = sizes->secret_share_size + 368; // Additional protocol data from document
+}
+
+void print_protocol_sizes(protocol_sizes_t* sizes) {
+    printf("\n=== PROTOCOL SIZE ANALYSIS ===\n");
+    printf("   Message header: %zu bytes\n", sizes->message_header_size);
+    printf("   Public key (serialized): %zu bytes\n", sizes->public_key_size);
+    printf("   Commitments: %zu bytes\n", sizes->commitments_size);
+    printf("   Secret shares: %zu bytes\n", sizes->secret_share_size);
+    printf("   Signature shares: %zu bytes\n", sizes->signature_share_size);
+    printf("   Total per participant: %zu bytes\n", sizes->total_per_participant);
+    printf("   Protocol overhead: %zu bytes\n", sizes->protocol_overhead);
+    printf("===================================\n");
+}
+
+BOOL send_message(comm_handle_t* comm, uint8_t msg_type, uint32_t participant, 
+                  const void* payload, uint16_t payload_len);
+BOOL send_data(comm_handle_t* comm, const void* data, size_t len);
+
+// COMMUNICATION MEASUREMENT 
+
+BOOL send_message_timed(comm_handle_t* comm, uint8_t msg_type, uint32_t participant, 
+                       const void* payload, uint16_t payload_len, double* elapsed_time) {
+    double start_time = get_time_milliseconds();
+    
+    BOOL result = send_message(comm, msg_type, participant, payload, payload_len);
+    
+    double end_time = get_time_milliseconds();
+    *elapsed_time = end_time - start_time;
+    
+    return result;
+}
+
+BOOL send_data_timed(comm_handle_t* comm, const void* data, size_t len, communication_stats_t* comm_stats) {
+    double start_time = get_time_milliseconds();
+    
+    BOOL result = send_data(comm, data, len);
+    
+    double end_time = get_time_milliseconds();
+    comm_stats->transmission_time = end_time - start_time;
+    comm_stats->data_size = len;
+    
+    if (comm_stats->transmission_time > 0) {
+        comm_stats->throughput_bps = (len * 8.0 * 1000.0) / comm_stats->transmission_time; // bits per second
+    }
+    
+    // Calculate segmentation for HID
+    if (comm->type == COMM_TYPE_USB_HID) {
+        size_t payload_per_report = comm->output_report_length - 2; // 2 bytes overhead
+        comm_stats->segments_required = (int)((len + payload_per_report - 1) / payload_per_report);
+        comm_stats->overhead_percentage = ((comm_stats->segments_required * 2.0) / len) * 100.0;
+    } else {
+        comm_stats->segments_required = 1;
+        comm_stats->overhead_percentage = 0.0;
+    }
+    
+    return result;
+}
+
+void print_communication_stats(const char* operation, communication_stats_t* comm_stats, 
+                             communication_type_t comm_type) {
+    printf("\n=== COMMUNICATION ANALYSIS: %s ===\n", operation);
+    printf("   Communication type: %s\n", 
+           comm_type == COMM_TYPE_USB_HID ? "USB HID" : "UART");
+    printf("   Data size: %zu bytes\n", comm_stats->data_size);
+    printf("   Transmission time: %.3f ms\n", comm_stats->transmission_time);
+    printf("   Throughput: %.0f bps (%.1f KB/s)\n", 
+           comm_stats->throughput_bps, comm_stats->throughput_bps / 8000.0);
+    
+    if (comm_type == COMM_TYPE_USB_HID) {
+        printf("   Segments required: %d\n", comm_stats->segments_required);
+        printf("   Protocol overhead: %.1f%%\n", comm_stats->overhead_percentage);
+    }
+    
+    // Performance assessment
+    if (comm_type == COMM_TYPE_USB_HID) {
+        if (comm_stats->transmission_time < 200.0) {
+            printf("   HID Performance: EXCELLENT\n");
+        } else if (comm_stats->transmission_time < 500.0) {
+            printf("    HID Performance: ACCEPTABLE\n");
+        } else {
+            printf("   HID Performance: SLOW\n");
+        }
+    } else {
+        if (comm_stats->transmission_time < 20.0) {
+            printf("   UART Performance: EXCELLENT\n");
+        } else if (comm_stats->transmission_time < 50.0) {
+            printf("    UART Performance: ACCEPTABLE\n");
+        } else {
+            printf("   UART Performance: SLOW\n");
+        }
+    }
+    printf("========================================\n");
+}
 
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
@@ -155,15 +413,23 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
                                            serialized_nonce_commitment_t* commitments,
                                            int num_shares,
                                            unsigned char* msg_hash,
-                                           unsigned char* final_signature) {
+                                           unsigned char* final_signature,
+                                           performance_stats_t* aggregation_stats,
+                                           memory_stats_t* aggregation_memory) {
     
     printf("\n=== ENHANCED FROST AGGREGATION (NONCE PERSISTENCE) ===\n");
+    
+    // Start timing and memory monitoring
+    double start_time = get_time_milliseconds();
+    init_memory_monitoring(aggregation_memory);
     
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     if (!ctx) {
         printf("Failed to create secp256k1 context\n");
         return 0;
     }
+    
+    update_memory_monitoring(aggregation_memory);
     
     verify_commitment_consistency(commitments, num_shares);
     
@@ -194,7 +460,9 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     memcpy(aggregator_keypair.public_keys.public_key, participant_keypairs[aggregator_pos].public_key, 64);
     memcpy(aggregator_keypair.public_keys.group_public_key, participant_keypairs[aggregator_pos].group_public_key, 64);
     
-    printf("Aggregator details:\n");
+    update_memory_monitoring(aggregation_memory);
+    
+    printf("  Aggregator details:\n");
     printf("   Index: %u\n", aggregator_keypair.public_keys.index);
     printf("   Max participants: %u\n", aggregator_keypair.public_keys.max_participants);
     print_hex("   Secret (first 8 bytes)", aggregator_keypair.secret, 8);
@@ -280,11 +548,19 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
                signing_commitments[i].binding[2], signing_commitments[i].binding[3]);
     }
     
+    update_memory_monitoring(aggregation_memory);
+    
     printf("\nMessage hash verification:\n");
     unsigned char expected_msg[12] = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
     unsigned char expected_hash[32];
     unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '_', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
-    secp256k1_tagged_sha256(ctx, expected_hash, tag, sizeof(tag), expected_msg, sizeof(expected_msg));
+    int hash_result = secp256k1_tagged_sha256(ctx, expected_hash, tag, sizeof(tag), expected_msg, sizeof(expected_msg));
+    
+    if (hash_result != 1) {
+        printf("ERROR: Hash computation failed!\n");
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
     
     if (memcmp(msg_hash, expected_hash, 32) != 0) {
         printf("ERROR: Message hash mismatch!\n");
@@ -301,17 +577,33 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
     printf("\nAttempting signature aggregation with persistence-aware data...\n");
     printf("Using %d signature shares from persistent nonces\n", num_shares);
     
+    // Measure aggregation time specifically
+    double aggregation_start = get_time_milliseconds();
     int return_val = secp256k1_frost_aggregate(ctx, final_signature, msg_hash,
                                               &aggregator_keypair, public_keys, 
                                               signing_commitments,
                                               frost_signature_shares, num_shares);
+    double aggregation_end = get_time_milliseconds();
+    
+    // Store aggregation timing
+    if (aggregation_stats->num_samples < 100) {
+        aggregation_stats->measurements[aggregation_stats->num_samples] = aggregation_end - aggregation_start;
+        aggregation_stats->num_samples++;
+    }
+    
+    update_memory_monitoring(aggregation_memory);
     
     if (return_val == 1) {
         printf("*** SIGNATURE AGGREGATION SUCCESS! ***\n");
         printf("Persistent nonces worked correctly!\n");
         
+        double verification_start = get_time_milliseconds();
         int is_signature_valid = secp256k1_frost_verify(ctx, final_signature, msg_hash, 
                                                         &aggregator_keypair.public_keys);
+        double verification_end = get_time_milliseconds();
+        
+        printf("Aggregation time: %.3f ms\n", aggregation_end - aggregation_start);
+        printf("Verification time: %.3f ms\n", verification_end - verification_start);
         
         if (is_signature_valid) {
             printf("🎊 PERFECT: FROST signature is mathematically valid!\n");
@@ -325,6 +617,12 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
         } else {
             printf(" WARNING: Aggregation succeeded but verification failed\n");
         }
+        
+        // Finalize timing and memory
+        double end_time = get_time_milliseconds();
+        finalize_memory_monitoring(aggregation_memory);
+        
+        printf("Total aggregation process time: %.3f ms\n", end_time - start_time);
         
         secp256k1_context_destroy(ctx);
         return is_signature_valid;
@@ -363,6 +661,7 @@ int aggregate_and_verify_signature_ENHANCED(serialized_signature_share_t* signat
                    binding_zeros ? "ZEROS" : "DATA");
         }
         
+        finalize_memory_monitoring(aggregation_memory);
         secp256k1_context_destroy(ctx);
         return 0;
     }
@@ -780,10 +1079,14 @@ void close_communication(comm_handle_t* comm) {
 }
 
 void compute_message_hash_verified(unsigned char* msg_hash, const unsigned char* msg, size_t msg_len) {
+    double start_time = get_time_milliseconds();
+    
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     unsigned char tag[14] = {'f', 'r', 'o', 's', 't', '_', 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l'};
     int return_val = secp256k1_tagged_sha256(ctx, msg_hash, tag, sizeof(tag), msg, msg_len);
     assert(return_val == 1);
+    
+    double end_time = get_time_milliseconds();
     
     printf("Message hash computation verified:\n");
     printf("   Message: \"");
@@ -801,13 +1104,35 @@ void compute_message_hash_verified(unsigned char* msg_hash, const unsigned char*
         printf("%02x", msg_hash[i]);
     }
     printf("\n");
+    printf("Hash computation time: %.3f ms\n", end_time - start_time);
     
     secp256k1_context_destroy(ctx);
 }
 
 int main(void) {
-    printf("=== FROST Signature Coordinator (NONCE PERSISTENCE SUPPORT) ===\n");
-    printf("Enhanced to work with persistent nonces across device restarts\n\n");
+    printf("=== FROST Signature Coordinator (PERFORMANCE EVALUATION) ===\n");
+    printf("Enhanced with comprehensive performance monitoring\n");
+    printf("Measuring: timing, memory, protocol sizes, communication efficiency\n\n");
+    
+    // Initialize performance monitoring
+    init_performance_counter();
+    
+    // Performance tracking variables
+    performance_stats_t keygen_stats = {0};
+    performance_stats_t signing_stats = {0};
+    performance_stats_t aggregation_stats = {0};
+    memory_stats_t overall_memory = {0};
+    memory_stats_t aggregation_memory = {0};
+    protocol_sizes_t protocol_sizes = {0};
+    communication_stats_t comm_stats_array[T * 2]; // For each participant, 2 phases
+    int comm_stats_count = 0;
+    
+    // Measure protocol sizes
+    measure_protocol_sizes(&protocol_sizes);
+    print_protocol_sizes(&protocol_sizes);
+    
+    // Initialize overall memory monitoring
+    init_memory_monitoring(&overall_memory);
     
     serialized_nonce_commitment_t commitments[T];
     serialized_signature_share_t signature_shares[T];
@@ -822,8 +1147,14 @@ int main(void) {
     printf("Computing message hash...\n");
     compute_message_hash_verified(msg_hash, msg, sizeof(msg));
     
+    // Phase 1: Nonce Commitment Collection
+    printf("\n=== PHASE 1: NONCE COMMITMENT COLLECTION ===\n");
+    double phase1_start = get_time_milliseconds();
+    
     for (int i = 0; i < T; i++) {
         printf("\n=== Processing Participant %d (Nonce Commitment Collection) ===\n", i+1);
+        
+        double participant_start = get_time_milliseconds();
         
         comm_handle_t comm = setup_communication(i+1);
         if (comm.type == 0) {
@@ -831,13 +1162,29 @@ int main(void) {
             continue;
         }
         
+        update_memory_monitoring(&overall_memory);
+        
         printf("Sending READY signal to participant %d...\n", i+1);
         printf("This will trigger nonce generation and persistence on device\n");
-        if (!send_message(&comm, MSG_TYPE_READY, i+1, NULL, 0)) {
+        
+        // Measure READY message transmission
+        double ready_time;
+        if (!send_message_timed(&comm, MSG_TYPE_READY, i+1, NULL, 0, &ready_time)) {
             printf("Failed to send READY signal to participant %d\n", i+1);
             close_communication(&comm);
             continue;
         }
+        
+        // Store communication stats
+        if (comm_stats_count < T * 2) {
+            comm_stats_array[comm_stats_count].transmission_time = ready_time;
+            comm_stats_array[comm_stats_count].data_size = sizeof(message_header_t);
+            comm_stats_array[comm_stats_count].throughput_bps = 
+                (sizeof(message_header_t) * 8.0 * 1000.0) / ready_time;
+            comm_stats_count++;
+        }
+        
+        printf("READY message transmission: %.3f ms\n", ready_time);
         
         printf("Waiting for nonce commitment from participant %d...\n", i+1);
         printf("Device will generate fresh nonce and persist to flash\n");
@@ -845,7 +1192,11 @@ int main(void) {
         message_header_t* header;
         void* payload;
         
+        double receive_start = get_time_milliseconds();
         if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), &header, &payload)) {
+            double receive_end = get_time_milliseconds();
+            printf("Nonce commitment reception: %.3f ms\n", receive_end - receive_start);
+            
             if (header->msg_type == MSG_TYPE_NONCE_COMMITMENT) {
                 uint8_t* payload_data = (uint8_t*)payload;
                 
@@ -858,6 +1209,9 @@ int main(void) {
                 printf("\n=== RECEIVED PERSISTENT NONCE COMMITMENT FROM PARTICIPANT %d ===\n", i+1);
                 printf("This commitment was generated and saved to flash\n");
                 printf("Participant index: %u\n", commitments[commitments_received].index);
+                printf("Commitment data size: %zu bytes\n", sizeof(serialized_nonce_commitment_t));
+                printf("Keypair data size: %zu bytes\n", sizeof(serialized_keypair_t));
+                
                 print_full_hex("Hiding Commitment", commitments[commitments_received].hiding, 64);
                 print_full_hex("Binding Commitment", commitments[commitments_received].binding, 64);
                 
@@ -872,6 +1226,14 @@ int main(void) {
                 
                 commitments_received++;
                 printf("Nonce persistence: Device can safely restart now\n");
+                
+                // Store keygen timing
+                double participant_end = get_time_milliseconds();
+                if (keygen_stats.num_samples < 100) {
+                    keygen_stats.measurements[keygen_stats.num_samples] = participant_end - participant_start;
+                    keygen_stats.num_samples++;
+                }
+                
             } else {
                 printf("Received unexpected message type: 0x%02X\n", header->msg_type);
             }
@@ -880,12 +1242,16 @@ int main(void) {
         }
         
         close_communication(&comm);
+        update_memory_monitoring(&overall_memory);
         
         if (commitments_received >= T) {
             printf("\nReceived minimum %d persistent commitments. Continuing...\n", T);
             break;
         }
     }
+    
+    double phase1_end = get_time_milliseconds();
+    printf("Phase 1 total time: %.3f ms\n", phase1_end - phase1_start);
     
     if (commitments_received < T) {
         printf("\nError: Received only %d commitments, need at least %d\n", 
@@ -911,12 +1277,16 @@ int main(void) {
         print_hex("  Binding (first 8 bytes)", commitments[i].binding, 64);
     }
     
-    printf("\n=== Sending Signing Data and Collecting Signature Shares ===\n");
+    // Phase 2: Signing
+    printf("\n=== PHASE 2: SIGNING DATA AND COLLECTING SIGNATURE SHARES ===\n");
     printf("Devices will use original nonces from flash persistence\n");
+    double phase2_start = get_time_milliseconds();
     
     for (int i = 0; i < T; i++) {
         uint32_t participant_index = commitments[i].index;
         printf("\n=== Processing Participant %u (Signature Generation) ===\n", participant_index);
+        
+        double signing_start = get_time_milliseconds();
         
         comm_handle_t comm = setup_communication(participant_index);
         if (comm.type == 0) {
@@ -937,6 +1307,7 @@ int main(void) {
         
         printf("Sending signing data to participant %u...\n", participant_index);
         printf("Device will load original nonce from flash persistence\n");
+        printf("Signing payload size: %u bytes\n", payload_len);
         
         printf("Sending to participant %u:\n", participant_index);
         printf("   Message hash: ");
@@ -955,7 +1326,9 @@ int main(void) {
             printf("...\n");
         }
         
-        if (!send_message(&comm, MSG_TYPE_SIGN, participant_index, payload, payload_len)) {
+        // Measure signing message transmission
+        double sign_transmission_time;
+        if (!send_message_timed(&comm, MSG_TYPE_SIGN, participant_index, payload, payload_len, &sign_transmission_time)) {
             printf("Failed to send signing data to participant %u\n", participant_index);
             free(payload);
             close_communication(&comm);
@@ -963,6 +1336,25 @@ int main(void) {
         } else {
             printf("Signing data sent successfully to participant %u\n", participant_index);
             printf("Device will verify commitment consistency and load original nonce\n");
+            printf("Signing data transmission: %.3f ms\n", sign_transmission_time);
+            
+            // Store communication stats
+            if (comm_stats_count < T * 2) {
+                communication_stats_t* stats = &comm_stats_array[comm_stats_count];
+                stats->transmission_time = sign_transmission_time;
+                stats->data_size = sizeof(message_header_t) + payload_len;
+                stats->throughput_bps = (stats->data_size * 8.0 * 1000.0) / sign_transmission_time;
+                
+                if (comm.type == COMM_TYPE_USB_HID) {
+                    size_t payload_per_report = comm.output_report_length - 2;
+                    stats->segments_required = (int)((stats->data_size + payload_per_report - 1) / payload_per_report);
+                    stats->overhead_percentage = ((stats->segments_required * 2.0) / stats->data_size) * 100.0;
+                } else {
+                    stats->segments_required = 1;
+                    stats->overhead_percentage = 0.0;
+                }
+                comm_stats_count++;
+            }
         }
         
         free(payload);
@@ -976,9 +1368,12 @@ int main(void) {
         DWORD timeout_ms = 30000;
         BOOL received_share = FALSE;
         
+        double signature_receive_start = get_time_milliseconds();
         while (!received_share && (GetTickCount() - start_time) < timeout_ms) {
             if (receive_complete_message(&comm, receive_buffer, sizeof(receive_buffer), 
                                        &header, &payload_response)) {
+                double signature_receive_end = get_time_milliseconds();
+                
                 if (header->msg_type == MSG_TYPE_SIGNATURE_SHARE && 
                     header->payload_len == sizeof(serialized_signature_share_t)) {
                     
@@ -988,6 +1383,9 @@ int main(void) {
                     printf("\n*** PERSISTENT SIGNATURE SHARE RECEIVED from Participant %u ***\n", 
                            sig_share->index);
                     printf("Generated using original nonce from flash persistence\n");
+                    printf("Signature share reception: %.3f ms\n", signature_receive_end - signature_receive_start);
+                    printf("Signature share size: %zu bytes\n", sizeof(serialized_signature_share_t));
+                    
                     print_full_hex("Signature Share", sig_share->response, 32);
                     
                     printf("\n=== FROST PERSISTENT SIGNATURE SHARE %d ===\n", shares_received + 1);
@@ -1001,6 +1399,14 @@ int main(void) {
                     
                     shares_received++;
                     received_share = TRUE;
+                    
+                    // Store signing timing
+                    double signing_end = get_time_milliseconds();
+                    if (signing_stats.num_samples < 100) {
+                        signing_stats.measurements[signing_stats.num_samples] = signing_end - signing_start;
+                        signing_stats.num_samples++;
+                    }
+                    
                 } else if (header->msg_type == MSG_TYPE_END_TRANSMISSION) {
                     printf("Received end transmission marker\n");
                 } else {
@@ -1018,7 +1424,11 @@ int main(void) {
         }
         
         close_communication(&comm);
+        update_memory_monitoring(&overall_memory);
     }
+    
+    double phase2_end = get_time_milliseconds();
+    printf("Phase 2 total time: %.3f ms\n", phase2_end - phase2_start);
     
     printf("\n=== Persistent Nonce Signing Process Complete ===\n");
     
@@ -1044,12 +1454,22 @@ int main(void) {
         unsigned char final_signature[64];
         memset(final_signature, 0, sizeof(final_signature));
         
+        double aggregation_start = get_time_milliseconds();
         int aggregation_result = aggregate_and_verify_signature_ENHANCED(signature_shares, 
                                                                         participant_keypairs,
                                                                         commitments,
                                                                         shares_received, 
                                                                         msg_hash, 
-                                                                        final_signature);
+                                                                        final_signature,
+                                                                        &aggregation_stats,
+                                                                        &aggregation_memory);
+        double aggregation_end = get_time_milliseconds();
+        
+        // Finalize overall memory monitoring
+        finalize_memory_monitoring(&overall_memory);
+        
+        // Calculate total time
+        double total_time = aggregation_end - phase1_start;
         
         if (aggregation_result) {
             printf("\n🎊 FROST SIGNATURE PROTOCOL WITH NONCE PERSISTENCE COMPLETED! 🎊\n");
@@ -1060,6 +1480,7 @@ int main(void) {
             printf("Signature verification: SUCCESS\n");
             printf("Nonce persistence: WORKING CORRECTLY\n");
             printf("All nonces were successfully restored from flash storage\n");
+            printf("Total protocol execution time: %.3f ms\n", total_time);
             printf("═══════════════════════════════════════════════════════════════════\n");
             
             printf("\nFinal aggregated FROST signature (from persistent nonces):\n");
@@ -1086,7 +1507,7 @@ int main(void) {
                                         participant_keypairs[i].public_key, 64);
             }
             
-            printf("\nONCE PERSISTENCE SUCCESS INDICATORS:\n");
+            printf("\nNONCE PERSISTENCE SUCCESS INDICATORS:\n");
             printf("   - All devices survived restart between Phase 1 and Phase 2\n");
             printf("   - Original nonces were correctly restored from flash\n");
             printf("   - Signature aggregation succeeded with persistent data\n");
@@ -1098,9 +1519,10 @@ int main(void) {
             printf("Nonce commitments collected: %d/%d\n", commitments_received, T);
             printf("Signature shares collected: %d/%d\n", shares_received, T);
             printf("Signature aggregation or verification: FAILED\n");
-            printf(" Nonce persistence: MAY HAVE ISSUES\n");
+            printf("Nonce persistence: MAY HAVE ISSUES\n");
+            printf("Total protocol execution time: %.3f ms\n", total_time);
             printf("═══════════════════════════════════════════════════════════════════\n");
-            printf("\n POSSIBLE NONCE PERSISTENCE PROBLEMS:\n");
+            printf("\nPOSSIBLE NONCE PERSISTENCE PROBLEMS:\n");
             printf("   - Devices may not have properly saved nonces to flash\n");
             printf("   - Original nonces may not have been correctly restored\n");
             printf("   - Commitment consistency verification may have failed\n");
@@ -1118,6 +1540,96 @@ int main(void) {
         printf("- Can read persistent nonces from flash in Phase 2\n");
         printf("- Have sufficient flash storage space\n");
     }
+    
+    // COMPREHENSIVE PERFORMANCE REPORT
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    COMPREHENSIVE PERFORMANCE EVALUATION REPORT                  ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+    
+    // Calculate and print key generation statistics
+    if (keygen_stats.num_samples > 0) {
+        calculate_performance_stats(&keygen_stats);
+        print_performance_stats("KEY GENERATION", &keygen_stats);
+    }
+    
+    // Calculate and print signing statistics
+    if (signing_stats.num_samples > 0) {
+        calculate_performance_stats(&signing_stats);
+        print_performance_stats("SIGNATURE GENERATION", &signing_stats);
+    }
+    
+    // Calculate and print aggregation statistics
+    if (aggregation_stats.num_samples > 0) {
+        calculate_performance_stats(&aggregation_stats);
+        print_performance_stats("SIGNATURE AGGREGATION", &aggregation_stats);
+    }
+    
+    // Print memory statistics
+    print_memory_stats("OVERALL PROTOCOL", &overall_memory);
+    print_memory_stats("SIGNATURE AGGREGATION", &aggregation_memory);
+    
+    // Print protocol size analysis
+    
+    // Print communication statistics
+    if (comm_stats_count > 0) {
+        printf("\n=== COMMUNICATION EFFICIENCY ANALYSIS ===\n");
+        double total_comm_time = 0;
+        size_t total_data = 0;
+        
+        for (int i = 0; i < comm_stats_count; i++) {
+            total_comm_time += comm_stats_array[i].transmission_time;
+            total_data += comm_stats_array[i].data_size;
+        }
+        
+        printf("   Total messages transmitted: %d\n", comm_stats_count);
+        printf("   Total data transmitted: %zu bytes\n", total_data);
+        printf("   Total communication time: %.3f ms\n", total_comm_time);
+        printf("   Average throughput: %.0f bps\n", 
+               (total_data * 8.0 * 1000.0) / total_comm_time);
+        printf("==========================================\n");
+    }
+    
+    // Summary performance indicators
+    printf("\n=== PERFORMANCE SUMMARY ===\n");
+    printf("   Protocol phases: 2 (Commitment Collection + Signing)\n");
+    printf("   Participants: %d\n", T);
+    printf("   Threshold: %d-out-of-%d\n", T, N);
+    
+    if (keygen_stats.num_samples > 0) {
+        printf("   Key generation average: %.3f ms\n", keygen_stats.mean);
+    }
+    if (signing_stats.num_samples > 0) {
+        printf("   Signing average: %.3f ms\n", signing_stats.mean);
+    }
+    if (aggregation_stats.num_samples > 0) {
+        printf("   Aggregation average: %.3f ms\n", aggregation_stats.mean);
+    }
+    
+    printf("   Memory overhead: %zu KB (%.1f%%)\n", 
+           overall_memory.overhead, overall_memory.percentage_increase);
+    printf("   Protocol data per participant: %zu bytes\n", protocol_sizes.total_per_participant);
+    
+    // Overall assessment
+    double total_avg = 0;
+    int stats_count = 0;
+    if (keygen_stats.num_samples > 0) { total_avg += keygen_stats.mean; stats_count++; }
+    if (signing_stats.num_samples > 0) { total_avg += signing_stats.mean; stats_count++; }
+    if (aggregation_stats.num_samples > 0) { total_avg += aggregation_stats.mean; stats_count++; }
+    
+    if (stats_count > 0) {
+        total_avg /= stats_count;
+        printf("\n🏆 OVERALL PERFORMANCE ASSESSMENT:\n");
+        if (total_avg < 1.0 && overall_memory.percentage_increase < 10.0) {
+            printf("   EXCELLENT: Sub-millisecond operations with low memory overhead\n");
+        } else if (total_avg < 5.0 && overall_memory.percentage_increase < 20.0) {
+            printf("    GOOD: Fast operations with acceptable memory usage\n");
+        } else {
+            printf("   NEEDS OPTIMIZATION: Consider performance improvements\n");
+        }
+    }
+    
+    printf("=====================================\n");
     
     printf("\nPress Enter to exit...\n");
     getchar();
