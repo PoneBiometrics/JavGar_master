@@ -24,8 +24,8 @@ The implementation follows the FROST protocol with two main phases:
 ├── signing_offpad/          # OFFPAD board firmware for signing
 ├── signing_pc/src/          # PC signing coordinator
 ├── presign_pc_tests/src/    # PC key generation and distribution tests
-├── signing_pc_tests/src/    # PC key generation and distribution tests
-└──
+├── signing_nucleo_tests/src/    # Nucleo board firmware for signing tests
+└── signing_offpad_tests/src/    # OFFPAD board firmware for signing tests
 ```
 
 ## Hardware Requirements
