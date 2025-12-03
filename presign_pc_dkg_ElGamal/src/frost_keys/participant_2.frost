@@ -1,0 +1,13 @@
+[PARTICIPANT_2_DKG_KEYPAIR]
+
+[SECRET_SHARE]
+generator_index=2
+receiver_index=2
+value=b359b50b68bdc3196778eafaf19a28723dbd8d84c9fdc0c2a2ec56f6c834818c
+
+[PUBLIC_KEY]
+index=2
+max_participants=3
+public_key=717b77b616ae423a3bfe3b4c6f01e3e8f5d4db0b7c4511c308c939016c2324010538148621a8461dfddf8c4610cde88bf24b8c44c54449f0b46096654b5c238b
+group_public_key=1ce5fced43cad0d4806ad5b4f5fc369e804987bdb8d70492c60654cd6b37f280983aca79d4af9014ce119a95a0ee9372f86f26c42fd2ff50f649e691e3652a25
+
